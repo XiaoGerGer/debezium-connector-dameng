@@ -1,0 +1,248 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.connector.dameng;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.Mockito.mock;
+
+import java.io.IOException;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.SQLException;
+import java.sql.SQLRecoverableException;
+import java.sql.SQLTimeoutException;
+import java.sql.SQLTransientConnectionException;
+import java.time.Duration;
+import java.util.stream.Stream;
+
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.errors.RetriableException;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import io.debezium.connector.base.ChangeEventQueue;
+import io.debezium.connector.dameng.logminer.LogMinerRow;
+import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
+import io.debezium.pipeline.DataChangeEvent;
+import io.debezium.relational.history.SchemaHistoryException;
+import io.debezium.util.LoggingContext;
+
+class DamengErrorHandlerTest {
+    @TempDir
+    Path directory;
+    private final DamengErrorHandler handler = new DamengErrorHandler(
+            new DamengConnectorConfig(DamengTestConfiguration.configuration().build()), mock(ChangeEventQueue.class), null);
+
+    @ParameterizedTest
+    @ValueSource(strings = { "primary", "standby" })
+    void shouldRetryObservedRoleAndMountInterruptions(String role) {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                .with("database.capture.role", role).build());
+        final var roleHandler = new DamengErrorHandler(config, mock(ChangeEventQueue.class), null);
+        assertThat(roleHandler.isRetriable(new SQLException("TRX interrupted by mount", "25000", -6508))).isTrue();
+        assertThat(roleHandler.isRetriable(new SQLException("System in mount status", "22000", -510))).isTrue();
+        assertThat(roleHandler.isRetriable(new SQLException("Server Mode invalid.", "", 6091))).isTrue();
+        assertThat(roleHandler.isRetriable(new SQLException("different data error", "22000", -511))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("unrelated transaction error", "25000", -6509))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("different SQLState", "42000", -6508))).isFalse();
+        assertThat(roleHandler.isRetriable(new SQLException("invalid password", "28000", 6002))).isFalse();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "primary, -510", "primary, -517", "primary, -522", "primary, -2082", "primary, -515",
+            "standby, -510", "standby, -517", "standby, -522", "standby, -2082", "standby, -515",
+            "primary, -608", "standby, -608"
+    })
+    void shouldRestartForDatabaseStatusAndSessionTimeoutErrorsWithinSharedRetryBudget(String role, int errorCode) {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration()
+                .with("database.capture.role", role).with("errors.max.retries", 2).build());
+        final var failure = new SQLException("database status or session changed", "22000", errorCode);
+        final var startup = new DamengErrorHandler(config, null, null);
+        assertThat(startup.canRetry(new IllegalStateException("startup failed", failure))).isTrue();
+
+        final var queue = new ChangeEventQueue.Builder<DataChangeEvent>()
+                .pollInterval(Duration.ofMillis(1)).maxBatchSize(8).maxQueueSize(64)
+                .loggingContextSupplier(() -> LoggingContext.forConnector("dameng", "test", "test")).build();
+        final var streaming = new DamengErrorHandler(config, queue, startup);
+        final var wrapper = new SQLException("query failed");
+        wrapper.setNextException(failure);
+        streaming.setProducerThrowable(wrapper);
+        assertThat(catchThrowable(queue::poll)).isInstanceOf(RetriableException.class).hasCause(wrapper);
+
+        final var exhausted = new DamengErrorHandler(config, null, streaming);
+        assertThat(exhausted.canRetry(failure)).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -510, -517, -522, -2082, -515, -608 })
+    void shouldRecognizeDatabaseStatusAndSessionTimeoutErrorsWithoutDependingOnSqlState(int errorCode) {
+        assertThat(handler.isRetriable(new SQLException("database status or session changed", null, errorCode))).isTrue();
+        assertThat(handler.isRetriable(new SQLException("database status or session changed", "", errorCode))).isTrue();
+        assertThat(handler.isRetriable(new SQLException("database status or session changed", "HY000", errorCode))).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -510, -517, -522, -2082, -515 })
+    void shouldNotRetryDatabaseStatusErrorsWrappedByTimeoutOrHistoryFailure(int errorCode) {
+        final var failure = new SQLException("database status or session changed", "22000", errorCode);
+        assertThat(handler.isRetriable(new SQLTimeoutException("query exceeded its budget", failure))).isFalse();
+        assertThat(handler.isRetriable(new SchemaHistoryException("Cannot persist DDL", failure))).isFalse();
+    }
+
+    @ParameterizedTest
+    @MethodSource("sessionRequestTimeouts")
+    void shouldRetrySessionRequestTimeoutsThroughJdbcExceptionChains(Throwable failure) {
+        assertThat(handler.isRetriable(failure)).isTrue();
+    }
+
+    private static Stream<Throwable> sessionRequestTimeouts() {
+        final var timeout = new SQLException("session request timeout", "22000", -608);
+        final var next = new SQLTimeoutException("query timed out");
+        next.setNextException(timeout);
+        final var cyclic = new SQLTimeoutException("query timed out");
+        final var nested = new SQLException("session request timeout", "22000", -608, cyclic);
+        cyclic.setNextException(nested);
+        return Stream.of(timeout,
+                new dm.jdbc.driver.DMException("session request timeout", "22000", -608, null),
+                new SQLTimeoutException("session request timeout", "22000", -608),
+                new SQLTimeoutException("query timed out", timeout),
+                new SQLException("session request timeout", "22000", -608, new SQLTimeoutException("query timed out")),
+                new RuntimeException("mining failed", next), cyclic);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { 0, 2 })
+    void shouldStopSessionRequestTimeoutRetriesWhenTheBudgetIsExhausted(int maxRetries) {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("errors.max.retries", maxRetries).build());
+        final var timeout = new SQLTimeoutException("session request timeout", "22000", -608);
+        DamengErrorHandler previous = null;
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            final var queue = new ChangeEventQueue.Builder<DataChangeEvent>()
+                    .pollInterval(Duration.ofMillis(1)).maxBatchSize(8).maxQueueSize(64)
+                    .loggingContextSupplier(() -> LoggingContext.forConnector("dameng", "test", "test")).build();
+            final var current = new DamengErrorHandler(config, queue, previous);
+            current.setProducerThrowable(timeout);
+            final var failure = catchThrowable(queue::poll);
+            if (attempt < maxRetries) {
+                assertThat(failure).isInstanceOf(RetriableException.class).hasCause(timeout);
+            }
+            else {
+                assertThat(failure).isInstanceOf(ConnectException.class).isNotInstanceOf(RetriableException.class).hasCause(timeout);
+            }
+            assertThat(current.getRetries()).isEqualTo(Math.min(attempt + 1, maxRetries));
+            previous = current;
+        }
+    }
+
+    @Test
+    void shouldKeepHistoryAndSnapshotBudgetFailuresFatalDespiteSessionRequestTimeouts() {
+        final var timeout = new SQLTimeoutException("session request timeout", "22000", -608);
+        assertThat(handler.isRetriable(new SchemaHistoryException("Cannot persist DDL", timeout))).isFalse();
+        assertThat(handler.isRetriable(new DamengSnapshotDeadline.SnapshotTimeoutException(1_000, timeout))).isFalse();
+        final var history = new SchemaHistoryException("Cannot persist DDL", new IOException("No space left on device"));
+        assertThat(handler.isRetriable(new SQLException("session request timeout", "22000", -608, history))).isFalse();
+    }
+
+    @Test
+    void shouldNotRetryAnAuthenticationFailureBecauseItsCleanupTimedOut() {
+        final var authentication = new SQLException("invalid password", "28000");
+        authentication.addSuppressed(new SQLException("session request timeout", "22000", -608));
+        assertThat(handler.isRetriable(authentication)).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -607, -609, 608, 0 })
+    void shouldNotClassifyOtherDataErrorsByTimeoutMessageAlone(int errorCode) {
+        assertThat(handler.isRetriable(new SQLException("session request timeout", "22000", errorCode))).isFalse();
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = { -501, -502, -503, -504, -511, -514, -518, -519 })
+    void shouldNotRetryOtherDatabaseStatusOrResourceErrors(int errorCode) {
+        assertThat(handler.isRetriable(new SQLException("System in status changing", "22000", errorCode))).isFalse();
+    }
+
+    @Test
+    void shouldRetryJdbcConnectionFailuresAndNestedIoFailures() {
+        assertThat(handler.isRetriable(new SQLException("communication failure", "08S01"))).isTrue();
+        assertThat(handler.isRetriable(new SQLException("connection closed", "08003"))).isTrue();
+        assertThat(handler.isRetriable(new SQLRecoverableException())).isTrue();
+        assertThat(handler.isRetriable(new SQLTransientConnectionException())).isTrue();
+        assertThat(handler.isRetriable(new SQLException("driver exception", new IOException("socket reset")))).isTrue();
+    }
+
+    @Test
+    void shouldInspectJdbcNextExceptionsWithoutLooping() {
+        final var wrapper = new SQLException("batch failed");
+        wrapper.setNextException(new SQLException("communication failure", "08S01"));
+        assertThat(handler.isRetriable(wrapper)).isTrue();
+        final var first = new SQLException("first");
+        final var second = new SQLException("second");
+        first.initCause(second);
+        second.initCause(first);
+        assertThat(handler.isRetriable(first)).isFalse();
+    }
+
+    @Test
+    void shouldNotRetryPermanentErrorsOrRepeatedQueryTimeouts() {
+        assertThat(handler.isRetriable(new SQLException("permission denied", "42501"))).isFalse();
+        assertThat(handler.isRetriable(new SQLException("invalid password", "28000"))).isFalse();
+        assertThat(handler.isRetriable(new SQLTimeoutException("query exceeded its budget"))).isFalse();
+        assertThat(handler.isRetriable(new SQLTimeoutException("query exceeded its budget", new IOException("cancelling query")))).isFalse();
+        assertThat(handler.isRetriable(new RuntimeException(new DamengSnapshotDeadline.SnapshotTimeoutException(1_000,
+                new SQLException("connection closed by deadline", "08003"))))).isFalse();
+        assertThat(handler.isRetriable(new IllegalStateException("archive gap"))).isFalse();
+        assertThat(handler.isRetriable(new IllegalStateException("buffer limit"))).isFalse();
+        assertThat(handler.isRetriable(null)).isFalse();
+    }
+
+    @Test
+    void shouldNotTreatHistoryStorageFailuresAsNetworkFailures() {
+        assertThat(handler.isRetriable(new SchemaHistoryException("Cannot persist DDL", new AccessDeniedException("history.dat")))).isFalse();
+        assertThat(handler.isRetriable(new SchemaHistoryException("Cannot persist DDL", new IOException("No space left on device")))).isFalse();
+        final var connection = new SQLException("connection closed", "08003");
+        connection.initCause(new SchemaHistoryException("Cannot persist DDL", new AccessDeniedException("history.dat")));
+        assertThat(handler.isRetriable(connection)).isFalse();
+    }
+
+    @Test
+    void shouldNotRetryLocalTransactionStorageFailuresEvenDuringConnectionCleanup() throws Exception {
+        final var blocked = Files.writeString(directory.resolve("not-a-directory"), "test");
+        try (var buffer = new LogMinerTransactionBuffer(512, 1048576, 1000, blocked, 1048576)) {
+            final var failure = catchThrowable(() -> buffer.add(new LogMinerRow(11, 10, 0, "tx", 1, 0, null, null, null,
+                    "INSERT", "r", 0, 0, java.time.Instant.EPOCH, 7)));
+            assertThat(failure).isNotNull();
+            assertThat(handler.isRetriable(failure)).isFalse();
+            assertThat(handler.isRetriable(new RuntimeException(failure))).isFalse();
+            final var networkFailure = new SQLException("connection closed", "08003");
+            networkFailure.addSuppressed(failure);
+            assertThat(handler.isRetriable(networkFailure)).isFalse();
+            final var timeout = new SQLTimeoutException("session request timeout", "22000", -608);
+            timeout.addSuppressed(failure);
+            assertThat(handler.isRetriable(timeout)).isFalse();
+        }
+    }
+
+    @Test
+    void shouldShareTheRetryBudgetAcrossFailedStartsAndStreamingRestarts() {
+        final var config = new DamengConnectorConfig(DamengTestConfiguration.configuration().with("errors.max.retries", 2).build());
+        final var first = new DamengErrorHandler(config, mock(ChangeEventQueue.class), null);
+        assertThat(first.canRetry(new SQLException("connection refused", "08001"))).isTrue();
+        assertThat(first.canRetry(new SQLException("invalid password", "28000"))).isFalse();
+        final var replacement = new DamengErrorHandler(config, mock(ChangeEventQueue.class), first);
+        assertThat(replacement.canRetry(new SQLException("connection refused", "08001"))).isTrue();
+        assertThat(replacement.canRetry(new SQLException("connection refused", "08001"))).isFalse();
+        replacement.resetRetries();
+        assertThat(replacement.canRetry(new SQLException("connection refused", "08001"))).isTrue();
+    }
+}

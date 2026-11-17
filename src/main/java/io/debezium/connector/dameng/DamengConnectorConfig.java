@@ -1,0 +1,759 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.connector.dameng;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+
+import org.apache.kafka.common.config.ConfigDef;
+import org.apache.kafka.common.config.ConfigDef.Importance;
+import org.apache.kafka.common.config.ConfigDef.Type;
+import org.apache.kafka.common.config.ConfigDef.Width;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import io.debezium.config.CommonConnectorConfig;
+import io.debezium.config.ConfigDefinition;
+import io.debezium.config.Configuration;
+import io.debezium.config.ConfigurationNames;
+import io.debezium.config.EnumeratedValue;
+import io.debezium.config.Field;
+import io.debezium.connector.AbstractSourceInfo;
+import io.debezium.connector.SourceInfoStructMaker;
+import io.debezium.document.Document;
+import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.relational.ColumnFilterMode;
+import io.debezium.relational.HistorizedRelationalDatabaseConnectorConfig;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.relational.TableId;
+import io.debezium.relational.Tables.TableFilter;
+import io.debezium.relational.history.HistoryRecordComparator;
+import io.debezium.spi.schema.DataCollectionId;
+
+public final class DamengConnectorConfig extends HistorizedRelationalDatabaseConnectorConfig {
+    private static final Logger LOGGER = LoggerFactory.getLogger(DamengConnectorConfig.class);
+    public static final Field HOSTS = Field.create("database.hosts")
+            .withDisplayName("Database hosts").withType(Type.STRING).required()
+            .withWidth(Width.LONG).withImportance(Importance.HIGH)
+            .withValidation(DamengConnectorConfig::validateHosts)
+            .withDescription("Required comma-separated host:port endpoints belonging to one database. "
+                    + "Use one endpoint for a standalone database and [IPv6]:port for IPv6 addresses. "
+                    + "The connector selects nodes by their actual roles and owns reconnects so offsets and schema history are restored together.");
+    public static final Field CAPTURE_ROLE = Field.create("database.capture.role")
+            .withDisplayName("Capture role").withEnum(CaptureRole.class, CaptureRole.PRIMARY)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH)
+            .withValidation(DamengConnectorConfig::validateCaptureRole)
+            .withDescription("Capture from primary (the default, including standalone NORMAL databases) or standby. "
+                    + "Standby capture uses the same database.hosts list to select a primary for signal writes and snapshot locks, "
+                    + "and never falls back to primary capture. All endpoints must use the same credentials and belong to one physical database family.");
+    public static final Field DATABASE_NAME = RelationalDatabaseConnectorConfig.DATABASE_NAME
+            .withDefault("DAMENG");
+    public static final Field STANDBY_REPLAY_TIMEOUT_MS = Field.create("database.standby.replay.timeout.ms")
+            .withDisplayName("Standby replay wait timeout").withType(Type.LONG).withDefault(60_000L)
+            .withWidth(Width.MEDIUM).withImportance(Importance.MEDIUM).withValidation(Field::isPositiveLong)
+            .withDescription("Maximum milliseconds to wait for a standby to replay a primary snapshot or signal boundary. "
+                    + "A timeout restarts the task without acknowledging the incomplete snapshot.");
+    public static final Field SNAPSHOT_MODE = Field.create(CommonConnectorConfig.SNAPSHOT_MODE_PROPERTY_NAME)
+            .withDisplayName("Snapshot mode").withEnum(SnapshotMode.class, SnapshotMode.NO_DATA)
+            .withWidth(Width.SHORT).withImportance(Importance.LOW)
+            .withDescription("Snapshot mode: initial, initial_only, no_data, recovery, or the legacy no_data alias never. "
+                    + "Defaults to no_data: capture schemas and stream changes without scanning existing rows.");
+    public static final Field SNAPSHOT_LOCKING_MODE = Field.create(CommonConnectorConfig.SNAPSHOT_LOCKING_MODE_PROPERTY_NAME)
+            .withDisplayName("Snapshot locking mode").withEnum(SnapshotLockingMode.class, SnapshotLockingMode.SHARED)
+            .withWidth(Width.SHORT).withImportance(Importance.LOW)
+            .withDescription("Keep table locks until the snapshot finishes. Default shared drains writers and blocks DML. "
+                    + "Optional intent_shared permits concurrent DML in every snapshot and recovery mode. "
+                    + "It excludes pre-baseline operations of transactions that commit later; initial row scans are not a consistent full snapshot.");
+    public static final Field CONNECTOR_ADAPTER = Field.create(ConfigurationNames.DATABASE_CONFIG_PREFIX + "connection.adapter")
+            .withDisplayName("Connector adapter").withEnum(ConnectorAdapter.class, ConnectorAdapter.LOG_MINER)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH)
+            .withDescription("Dameng change capture adapter. Dameng currently supports LogMiner.");
+    public static final Field SOURCE_INFO_STRUCT_MAKER = CommonConnectorConfig.SOURCE_INFO_STRUCT_MAKER
+            .withDefault(DamengSourceInfoStructMaker.class.getName());
+    public static final Field QUERY_FETCH_SIZE = CommonConnectorConfig.QUERY_FETCH_SIZE.withDefault(2_000);
+    public static final Field QUERY_TIMEOUT_MS = RelationalDatabaseConnectorConfig.QUERY_TIMEOUT_MS
+            .withValidation(Field::isNonNegativeInteger);
+    public static final Field SOCKET_TIMEOUT_MS = Field.create("database.socket.timeout.ms")
+            .withDisplayName("Socket timeout").withType(Type.INT).withDefault(600_000)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH)
+            .withValidation(Field::isPositiveInteger)
+            .withDescription("Maximum wait in milliseconds for Dameng JDBC network communication. "
+                    + "Must be positive and is passed to the driver's socketTimeout property; use this setting instead of database.socketTimeout.");
+    public static final Field SNAPSHOT_MAX_DURATION_MS = Field.create("snapshot.max.duration.ms")
+            .withDisplayName("Maximum initial snapshot duration").withType(Type.LONG).withDefault(600_000L)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH)
+            .withValidation(Field::isPositiveLong)
+            .withDescription("Maximum total initial snapshot duration in milliseconds, including schema locks, data reads and event queue waits. "
+                    + "Must be positive. Exceeding the deadline aborts the snapshot and closes its connection to release locks; "
+                    + "increase this value explicitly when a larger initial snapshot is required.");
+    public static final Field LOG_MINING_BATCH_SIZE = Field.create("log.mining.batch.size")
+            .withDisplayName("Log mining batch size").withType(Type.INT).withDefault(1_000)
+            .withWidth(Width.SHORT).withImportance(Importance.LOW)
+            .withValidation(Field::isPositiveInteger)
+            .withDescription("Maximum forward LSN span in fixed window mode; unused in archive_bytes mode. "
+                    + "Unfinished transactions remain in the memory/disk transaction cache across windows.");
+    public static final Field LOG_MINING_WINDOW_STRATEGY = Field.create("log.mining.window.strategy")
+            .withDisplayName("Mining window strategy").withEnum(MiningWindowStrategy.class, MiningWindowStrategy.ARCHIVE_BYTES)
+            .withWidth(Width.MEDIUM).withImportance(Importance.MEDIUM)
+            .withValidation(DamengConnectorConfig::validateRemovedMiningWindowSettings)
+            .withDescription("Select forward windows using archive_bytes (archive file byte budget, the default) or fixed (LSN span).");
+    public static final Field LOG_MINING_WINDOW_MAX_BYTES = Field.create("log.mining.window.max.bytes")
+            .withDisplayName("Forward archive file byte budget").withType(Type.LONG).withDefault(64L * 1024 * 1024)
+            .withWidth(Width.MEDIUM).withImportance(Importance.MEDIUM).withValidation(Field::isPositiveLong)
+            .withDescription("Soft budget for the total LEN of archive files selected for one forward scan in archive_bytes mode. "
+                    + "Defaults to 64 MiB. Whole files and shared boundary files can exceed it; reconstruction is never truncated. "
+                    + "This is neither a JVM memory limit nor the number of bytes actually read.");
+    public static final Field LOG_MINING_BUFFER_MAX_BYTES = Field.create("log.mining.buffer.max.bytes")
+            .withDisplayName("Deprecated cumulative byte budget").withType(Type.STRING)
+            .withWidth(Width.MEDIUM).withImportance(Importance.LOW)
+            .withDescription("Deprecated and ignored. Cumulative mining input no longer stops a task. "
+                    + "Use log.mining.buffer.memory.bytes for resident transaction caching and log.mining.buffer.max.sql.bytes for a single SQL payload.");
+    public static final Field LOG_MINING_BUFFER_MAX_RECORDS = Field.create("log.mining.buffer.max.records")
+            .withDisplayName("Deprecated cumulative row budget").withType(Type.STRING)
+            .withWidth(Width.MEDIUM).withImportance(Importance.LOW)
+            .withDescription("Deprecated and ignored. Cumulative mining input no longer stops a task. "
+                    + "Use log.mining.buffer.max.transactions to limit resident transaction metadata entries.");
+    public static final Field LOG_MINING_BUFFER_MAX_SQL_BYTES = Field.create("log.mining.buffer.max.sql.bytes")
+            .withDisplayName("Single SQL payload limit").withType(Type.LONG).withDefault(16L * 1024 * 1024)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
+            .withDescription("Maximum UTF-16 payload bytes of one SQL_REDO, including all continuation pieces. "
+                    + "Checked before concatenation; JDBC input, builder capacity and temporary copies require additional heap. "
+                    + "SQL payloads cannot spill while being assembled. Exceeding the limit stops the task without skipping history.");
+    public static final Field LOG_MINING_BUFFER_MAX_TRANSACTIONS = Field.create("log.mining.buffer.max.transactions")
+            .withDisplayName("Resident transaction count limit").withType(Type.LONG).withDefault(1_000_000L)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
+            .withDescription("Maximum simultaneously retained transaction metadata entries, including committed transactions awaiting dispatch. "
+                    + "Metadata cannot spill and also counts against log.mining.buffer.memory.bytes. Exceeding either limit stops the task.");
+    public static final Field LOG_MINING_BUFFER_MEMORY_BYTES = Field.create("log.mining.buffer.memory.bytes")
+            .withDisplayName("Transaction cache memory threshold").withType(Type.LONG).withDefault(64L * 1024 * 1024)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
+            .withDescription("Task-wide estimated transaction cache memory threshold. Spill transactions to local temporary files when exceeded. "
+                    + "Includes retained transaction metadata; excludes JDBC, SQL continuation assembly and event queues. This is not a JVM heap limit.");
+    public static final Field LOG_MINING_BUFFER_SPILL_PATH = Field.create("log.mining.buffer.spill.path")
+            .withDisplayName("Transaction spill directory").withType(Type.STRING).withDefault(System.getProperty("java.io.tmpdir"))
+            .withWidth(Width.LONG).withImportance(Importance.HIGH).withValidation(Field::isRequired)
+            .withDescription("Writable parent directory for task-owned temporary transaction files. Use a disk-backed Docker mount. "
+                    + "Files are disposable, are not a recovery source, and do not replace archive retention. Each run creates its own directory.");
+    public static final Field LOG_MINING_BUFFER_SPILL_MAX_BYTES = Field.create("log.mining.buffer.spill.max.bytes")
+            .withDisplayName("Transaction spill disk limit").withType(Type.LONG).withDefault(1024L * 1024 * 1024)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
+            .withDescription("Maximum total temporary transaction file bytes for one task run. Exceeding the limit or any local I/O failure "
+                    + "stops the task without skipping history. Allow additional filesystem free space and retain archives for restart.");
+
+    public static final Field PARTITION_DROP_IGNORE = Field.create("partition.drop.ignore")
+            .withDisplayName("Ignore partition drops and truncates").withType(Type.BOOLEAN).withDefault(false)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH).withValidation(Field::isBoolean)
+            .withDescription("Ignore parsed DROP PARTITION/SUBPARTITION and TRUNCATE PARTITION/SUBPARTITION statements, "
+                    + "including TRUNCATE TABLE ... PARTITION. Defaults to false and stops on these operations, "
+                    + "even if schema.history.internal.skip.unparseable.ddl is true. DM can remove partition rows without per-row DELETE redo, "
+                    + "so enabling this option may leave removed rows downstream. Does not allow partition EXCHANGE.");
+
+    public static final Field PARTITION_EXCHANGE_IGNORE = Field.create("partition.exchange.ignore")
+            .withDisplayName("Ignore partition exchanges").withType(Type.BOOLEAN).withDefault(false)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH).withValidation(Field::isBoolean)
+            .withDescription("Ignore fully parsed EXCHANGE PARTITION/SUBPARTITION statements affecting either a captured table or a retained historical table. "
+                    + "Defaults to false and stops on these operations, even if schema.history.internal.skip.unparseable.ddl is true. "
+                    + "Exchanges outside both tables' processing scope are skipped without this opt-in. Both table identities must be resolvable. "
+                    + "Ignoring preserves historical schemas and object-ID mappings without emitting exchange row or truncate events; "
+                    + "exchanged rows may be missing or remain under the wrong table downstream, and subsequent decoding may fail or be incorrect.");
+
+    public static final Field CASCADE_DROP_IGNORE = Field.create("cascade.drop.ignore")
+            .withDisplayName("Ignore cascading object drops").withType(Type.BOOLEAN).withDefault(false)
+            .withWidth(Width.SHORT).withImportance(Importance.HIGH).withValidation(Field::isBoolean)
+            .withDescription("Ignore fully parsed DROP USER/SCHEMA/DOMAIN/TYPE/CLASS ... CASCADE statements. Defaults to false and stops on these operations, "
+                    + "even if schema.history.internal.skip.unparseable.ddl is true. Affected tables cannot be fully determined from the redo. "
+                    + "Ignoring preserves historical schemas and object-ID mappings without emitting deletion events; downstream data may remain, "
+                    + "and same-name recreation or object-ID reuse may cause later failures or incorrect decoding. "
+                    + "Does not allow cascading TRUNCATE or change supported table, TYPE BODY or PROFILE operations.");
+
+    private static final ConfigDefinition CONFIG_DEFINITION = HistorizedRelationalDatabaseConnectorConfig.CONFIG_DEFINITION.edit()
+            .excluding(CommonConnectorConfig.QUERY_FETCH_SIZE)
+            .excluding(RelationalDatabaseConnectorConfig.HOSTNAME, RelationalDatabaseConnectorConfig.PORT)
+            .excluding(RelationalDatabaseConnectorConfig.QUERY_TIMEOUT_MS)
+            .name("Dameng")
+            .group(Field.Group.CONNECTION, HOSTS, CAPTURE_ROLE, STANDBY_REPLAY_TIMEOUT_MS, DATABASE_NAME, SOCKET_TIMEOUT_MS, QUERY_TIMEOUT_MS,
+                    RelationalDatabaseConnectorConfig.USER,
+                    RelationalDatabaseConnectorConfig.PASSWORD)
+            .group(Field.Group.CONNECTOR_SNAPSHOT, SNAPSHOT_MODE, SNAPSHOT_LOCKING_MODE, SNAPSHOT_MAX_DURATION_MS)
+            .group(Field.Group.CONNECTOR, CONNECTOR_ADAPTER, LOG_MINING_BATCH_SIZE,
+                    LOG_MINING_WINDOW_STRATEGY, LOG_MINING_WINDOW_MAX_BYTES,
+                    LOG_MINING_BUFFER_MAX_BYTES,
+                    LOG_MINING_BUFFER_MAX_RECORDS, LOG_MINING_BUFFER_MAX_SQL_BYTES, LOG_MINING_BUFFER_MAX_TRANSACTIONS, LOG_MINING_BUFFER_MEMORY_BYTES,
+                    LOG_MINING_BUFFER_SPILL_PATH, LOG_MINING_BUFFER_SPILL_MAX_BYTES,
+                    QUERY_FETCH_SIZE, UNAVAILABLE_VALUE_PLACEHOLDER, PARTITION_DROP_IGNORE, PARTITION_EXCHANGE_IGNORE, CASCADE_DROP_IGNORE)
+            .group(Field.Group.CONNECTOR, SOURCE_INFO_STRUCT_MAKER)
+            .create();
+    public static final Field.Set ALL_FIELDS = Field.setOf(CONFIG_DEFINITION.all());
+
+    private static final Map<String, String> CONTROLLED_DRIVER_PROPERTIES = Map.of(
+            "loginMode", "1", "loginStatus", "4", "rwSeparate", "0", "autoReconnect", "0", "switchTimes", "1", "switchInterval", "200");
+    private static final Set<String> UNSAFE_DRIVER_PROPERTIES = Set.of("url", "host", "connection.factory.class", "dmsvcconf", "debezium", "unixsocketfile");
+    private static final List<String> REMOVED_CONNECTION_PROPERTIES = List.of("database.hostname", "database.port", "database.failover.hosts", "database.standby.hosts");
+
+    private final SnapshotMode snapshotMode;
+    private final SnapshotLockingMode snapshotLockingMode;
+    private final ConnectorAdapter connectorAdapter;
+    private final int logMiningBatchSize;
+    private final String hosts;
+    private final CaptureRole captureRole;
+    private boolean caseInsensitiveIdentifiers;
+    private List<TableId> signalTableIds;
+
+    boolean hasCaseInsensitiveIdentifiers() {
+        return caseInsensitiveIdentifiers;
+    }
+
+    /** Set from the database before history, signals or snapshot services are started. */
+    void configureIdentifierCase(boolean caseInsensitive) {
+        caseInsensitiveIdentifiers = caseInsensitive;
+        signalTableIds = null;
+    }
+
+    @Override
+    public List<String> getSignalingDataCollectionIds() {
+        return caseInsensitiveIdentifiers ? super.getSignalingDataCollectionIds().stream().map(name -> name.toUpperCase(Locale.ROOT)).toList()
+                : super.getSignalingDataCollectionIds();
+    }
+
+    @Override
+    public List<TableId> getSignalingDataCollectionTableIds() {
+        // DM uses schema.table, while the common default parses two parts as catalog.table.
+        if (signalTableIds == null) {
+            signalTableIds = getSignalingDataCollectionIds().stream().map(name -> TableId.parse(name, false)).toList();
+        }
+        return signalTableIds;
+    }
+
+    @Override
+    public boolean isSignalDataCollection(DataCollectionId id) {
+        // This is checked for every emitted event; avoid allocating parsed IDs on the hot path.
+        return getSignalingDataCollectionTableIds().contains(id);
+    }
+
+    public DamengConnectorConfig(Configuration config) {
+        super(DamengConnector.class, config, new SystemTablesFilter(), table -> table.schema() + "." + table.table(), false,
+                ColumnFilterMode.SCHEMA, false);
+        validateRemovedConnectionProperties(config);
+        hosts = normalizeHosts(config.getString(HOSTS));
+        captureRole = CaptureRole.parse(config.getString(CAPTURE_ROLE));
+        snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE), SnapshotMode.NO_DATA);
+        snapshotLockingMode = SnapshotLockingMode.parse(config.getString(SNAPSHOT_LOCKING_MODE), SnapshotLockingMode.SHARED);
+        connectorAdapter = ConnectorAdapter.parse(config.getString(CONNECTOR_ADAPTER));
+        if (connectorAdapter != ConnectorAdapter.LOG_MINER) {
+            throw new IllegalArgumentException("Dameng currently supports only the logminer adapter");
+        }
+        if (config.getBoolean(INCREMENTAL_SNAPSHOT_ALLOW_SCHEMA_CHANGES)) {
+            throw new IllegalArgumentException(
+                    "Dameng incremental.snapshot.allow.schema.changes=true is not implemented; keep schemas stable during incremental snapshots");
+        }
+        if (getSignalingDataCollectionIds().size() > 1) {
+            throw new IllegalArgumentException("Dameng signal.data.collection must identify a single schema-qualified signal table");
+        }
+        for (final var tableId : getSignalingDataCollectionTableIds()) {
+            if (DamengInternalTableType.fromTableId(tableId).isPresent()) {
+                throw new IllegalArgumentException("Dameng signal.data.collection cannot use an internal table: " + tableId);
+            }
+        }
+        logMiningBatchSize = config.getInteger(LOG_MINING_BATCH_SIZE);
+        if (getLogMiningWindowMaxBytes() <= 0) {
+            throw new IllegalArgumentException("Dameng mining window byte budget must be positive");
+        }
+        getMiningWindowStrategy();
+        validateRemovedMiningWindowSettings(config, LOG_MINING_WINDOW_STRATEGY, (field, value, problem) -> {
+            throw new IllegalArgumentException(problem);
+        });
+        if (logMiningBatchSize <= 0) {
+            throw new IllegalArgumentException("Dameng log.mining.batch.size must be positive");
+        }
+        for (var legacy : List.of(LOG_MINING_BUFFER_MAX_BYTES, LOG_MINING_BUFFER_MAX_RECORDS)) {
+            if (config.hasKey(legacy.name())) {
+                LOGGER.warn("Dameng {} is deprecated and ignored; cumulative mining work no longer stops the task. Remove this setting; "
+                        + "resident cache, transaction metadata, single SQL and spill disk limits remain active.", legacy.name());
+            }
+        }
+        if (getLogMiningBufferMaxSqlBytes() <= 0 || getLogMiningBufferMaxTransactions() <= 0) {
+            throw new IllegalArgumentException("Dameng log.mining.buffer.max.sql.bytes and log.mining.buffer.max.transactions must both be positive");
+        }
+        if (getLogMiningBufferMemoryBytes() <= 0 || getLogMiningBufferSpillMaxBytes() <= 0 || getLogMiningBufferSpillPath().isBlank()) {
+            throw new IllegalArgumentException("Dameng transaction memory/disk limits must be positive and spill path must not be blank");
+        }
+        if (getSnapshotMaxDurationMs() <= 0) {
+            throw new IllegalArgumentException("Dameng snapshot.max.duration.ms must be positive");
+        }
+        if (getSnapshotMaxThreads() != 1) {
+            throw new IllegalArgumentException("Dameng snapshot.max.threads must be 1; parallel snapshot connections are not supported");
+        }
+        if (getSocketTimeoutMs() <= 0) {
+            throw new IllegalArgumentException("Dameng database.socket.timeout.ms must be positive");
+        }
+        if (config.getInteger(QUERY_TIMEOUT_MS) < 0) {
+            throw new IllegalArgumentException("Dameng database.query.timeout.ms must not be negative");
+        }
+        if (config.getString("database.socketTimeout") != null) {
+            throw new IllegalArgumentException("Use database.socket.timeout.ms instead of database.socketTimeout for Dameng");
+        }
+        if (getStandbyReplayTimeoutMs() <= 0) {
+            throw new IllegalArgumentException("Dameng database.standby.replay.timeout.ms must be positive");
+        }
+        validateDriverProperties(config);
+    }
+
+    public static ConfigDef configDef() {
+        return CONFIG_DEFINITION.configDef();
+    }
+
+    public boolean isPartitionDropIgnored() {
+        return getConfig().getBoolean(PARTITION_DROP_IGNORE);
+    }
+
+    public boolean isPartitionExchangeIgnored() {
+        return getConfig().getBoolean(PARTITION_EXCHANGE_IGNORE);
+    }
+
+    public boolean isCascadeDropIgnored() {
+        return getConfig().getBoolean(CASCADE_DROP_IGNORE);
+    }
+
+    @Override
+    public SnapshotMode getSnapshotMode() {
+        return snapshotMode;
+    }
+
+    public Optional<SnapshotLockingMode> getSnapshotLockingMode() {
+        return Optional.of(snapshotLockingMode);
+    }
+
+    public ConnectorAdapter getConnectorAdapter() {
+        return connectorAdapter;
+    }
+
+    public int getLogMiningBatchSize() {
+        return logMiningBatchSize;
+    }
+
+    public MiningWindowStrategy getMiningWindowStrategy() {
+        return MiningWindowStrategy.parse(getConfig().getString(LOG_MINING_WINDOW_STRATEGY));
+    }
+
+    public long getLogMiningWindowMaxBytes() {
+        return getConfig().getLong(LOG_MINING_WINDOW_MAX_BYTES);
+    }
+
+    private static int validateRemovedMiningWindowSettings(Configuration config, Field field, Field.ValidationOutput problems) {
+        int errors = 0;
+        for (var removed : List.of("log.mining.window.adaptive.enabled", "log.mining.batch.size.min", "log.mining.batch.size.max", "log.mining.window.target.ms")) {
+            if (config.hasKey(removed)) {
+                problems.accept(field, config.getString(field), "Dameng " + removed + " has been removed. Remove this setting and use "
+                        + "log.mining.window.strategy=archive_bytes (default) or fixed; configure fixed spans with log.mining.batch.size.");
+                errors++;
+            }
+        }
+        return errors;
+    }
+
+    public int getQueryFetchSize() {
+        return getConfig().getInteger(QUERY_FETCH_SIZE);
+    }
+
+    public long getLogMiningBufferMaxSqlBytes() {
+        return getConfig().getLong(LOG_MINING_BUFFER_MAX_SQL_BYTES);
+    }
+
+    public long getLogMiningBufferMaxTransactions() {
+        return getConfig().getLong(LOG_MINING_BUFFER_MAX_TRANSACTIONS);
+    }
+
+    public long getLogMiningBufferMemoryBytes() {
+        return getConfig().getLong(LOG_MINING_BUFFER_MEMORY_BYTES);
+    }
+
+    public String getLogMiningBufferSpillPath() {
+        return getConfig().getString(LOG_MINING_BUFFER_SPILL_PATH);
+    }
+
+    public long getLogMiningBufferSpillMaxBytes() {
+        return getConfig().getLong(LOG_MINING_BUFFER_SPILL_MAX_BYTES);
+    }
+
+    public long getSnapshotMaxDurationMs() {
+        return getConfig().getLong(SNAPSHOT_MAX_DURATION_MS);
+    }
+
+    public int getSocketTimeoutMs() {
+        return getConfig().getInteger(SOCKET_TIMEOUT_MS);
+    }
+
+    public String getDatabaseName() {
+        return getConfig().getString(DATABASE_NAME);
+    }
+
+    public String getHosts() {
+        return hosts;
+    }
+
+    public CaptureRole getCaptureRole() {
+        return captureRole;
+    }
+
+    public boolean isStandbyMiningEnabled() {
+        return captureRole == CaptureRole.STANDBY;
+    }
+
+    public long getStandbyReplayTimeoutMs() {
+        return getConfig().getLong(STANDBY_REPLAY_TIMEOUT_MS);
+    }
+
+    @Override
+    public JdbcConfiguration getJdbcConfig() {
+        final var builder = JdbcConfiguration.copy(getPrimaryJdbcConfig());
+        if (isStandbyMiningEnabled()) {
+            builder.with("capture.role", CaptureRole.STANDBY.getValue()).with("loginMode", "2");
+        }
+        return builder.build();
+    }
+
+    public JdbcConfiguration getPrimaryJdbcConfig() {
+        final var builder = JdbcConfiguration.copy(super.getJdbcConfig())
+                .without("socket.timeout.ms")
+                .without("standby.hosts").without("standby.replay.timeout.ms")
+                .without("hostname").without("port").without("failover.hosts")
+                .with("socketTimeout", getSocketTimeoutMs())
+                .with("hosts", hosts)
+                .with("capture.role", CaptureRole.PRIMARY.getValue())
+                .withDatabase(getDatabaseName());
+        CONTROLLED_DRIVER_PROPERTIES.forEach(builder::with);
+        return builder.build();
+    }
+
+    private Map<String, String> controlledDriverProperties() {
+        return CONTROLLED_DRIVER_PROPERTIES;
+    }
+
+    private void validateDriverProperties(Configuration rawConfig) {
+        final var controlled = controlledDriverProperties();
+        for (var property : super.getJdbcConfig().asMap().entrySet()) {
+            final var key = property.getKey();
+            final var normalized = key.replace("_", "").toLowerCase(Locale.ROOT);
+            if (UNSAFE_DRIVER_PROPERTIES.contains(normalized)) {
+                throw new IllegalArgumentException("Dameng database." + key + " / driver." + key
+                        + " is not supported; configure database.hosts");
+            }
+            if (normalized.equals("autoreconnect") || normalized.equals("reconnect") || normalized.equals("doswitch")) {
+                if (!key.equals("autoReconnect") || !property.getValue().equals("0")) {
+                    throw new IllegalArgumentException("Dameng autoReconnect must be 0; driver reconnect aliases are not supported because the connector owns recovery");
+                }
+            }
+            for (var required : controlled.entrySet()) {
+                if (normalized.equals(required.getKey().toLowerCase(Locale.ROOT))
+                        && (!key.equals(required.getKey()) || !property.getValue().equals(required.getValue()))) {
+                    throw new IllegalArgumentException("Dameng " + required.getKey() + " must be " + required.getValue()
+                            + "; connection routing and retries are controlled by the connector");
+                }
+            }
+        }
+        for (var name : rawConfig.asMap().keySet()) {
+            if (name.startsWith("driver.")) {
+                final var normalized = name.substring("driver.".length()).replace("_", "").toLowerCase(Locale.ROOT);
+                if (Set.of("hosts", "capture.role", "hostname", "port", "failover.hosts", "standby.hosts").contains(normalized)) {
+                    throw new IllegalArgumentException("Dameng " + name + " is not supported; configure database.hosts and database.capture.role");
+                }
+                if (normalized.equals("sockettimeout") || normalized.equals("socket.timeout.ms")) {
+                    throw new IllegalArgumentException("Use database.socket.timeout.ms instead of " + name + " for Dameng");
+                }
+            }
+        }
+    }
+
+    private static int validateHosts(Configuration config, Field field, Field.ValidationOutput problems) {
+        try {
+            validateRemovedConnectionProperties(config);
+            normalizeHosts(config.getString(field));
+            return 0;
+        }
+        catch (IllegalArgumentException e) {
+            problems.accept(field, config.getString(field), e.getMessage());
+            return 1;
+        }
+    }
+
+    private static int validateCaptureRole(Configuration config, Field field, Field.ValidationOutput problems) {
+        try {
+            CaptureRole.parse(config.getString(field));
+            return 0;
+        }
+        catch (IllegalArgumentException e) {
+            problems.accept(field, config.getString(field), e.getMessage());
+            return 1;
+        }
+    }
+
+    private static void validateRemovedConnectionProperties(Configuration config) {
+        for (var name : REMOVED_CONNECTION_PROPERTIES) {
+            if (config.keys().contains(name)) {
+                throw new IllegalArgumentException("Dameng " + name + " has been removed; use database.hosts and database.capture.role instead");
+            }
+        }
+    }
+
+    private static String normalizeHosts(String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("Dameng database.hosts is required; use host:port or [IPv6]:port");
+        }
+        final List<String> endpoints = new ArrayList<>();
+        for (String entry : value.split(",", -1)) {
+            final var endpoint = entry.trim();
+            final int separator = endpoint.lastIndexOf(':');
+            if (separator <= 0 || separator == endpoint.length() - 1) {
+                throw new IllegalArgumentException("database.hosts entries must use host:port or [IPv6]:port");
+            }
+            final var host = endpoint.substring(0, separator);
+            validateHostValue(host);
+            if (host.contains(":") && !(host.startsWith("[") && host.endsWith("]"))) {
+                throw new IllegalArgumentException("database.hosts IPv6 addresses must be enclosed in brackets");
+            }
+            final int port;
+            try {
+                port = Integer.parseInt(endpoint.substring(separator + 1));
+            }
+            catch (NumberFormatException e) {
+                throw new IllegalArgumentException("database.hosts requires a numeric port", e);
+            }
+            if (port < 1 || port > 65535) {
+                throw new IllegalArgumentException("database.hosts ports must be between 1 and 65535");
+            }
+            endpoints.add(host + ':' + port);
+        }
+        return String.join(",", endpoints);
+    }
+
+    private static void validateHostValue(String value) {
+        if (value.isBlank() || value.chars().anyMatch(character -> Character.isWhitespace(character)
+                || "/\\?#@&=,();${}".indexOf(character) >= 0)) {
+            throw new IllegalArgumentException("Dameng database.hosts hostnames must contain only an address or service hostname, without JDBC URL parameters");
+        }
+        if ((value.contains("[") || value.contains("]")) && !(value.startsWith("[") && value.endsWith("]") && value.indexOf(']') == value.length() - 1)) {
+            throw new IllegalArgumentException("Dameng database.hosts IPv6 brackets must enclose the whole hostname");
+        }
+    }
+
+    @Override
+    protected SourceInfoStructMaker<? extends AbstractSourceInfo> getSourceInfoStructMaker(Version version) {
+        return getSourceInfoStructMaker(SOURCE_INFO_STRUCT_MAKER, Module.name(), Module.version(), this);
+    }
+
+    @Override
+    public HistoryRecordComparator getHistoryRecordComparator() {
+        return new HistoryRecordComparator() {
+            @Override
+            protected boolean isPositionAtOrBefore(Document recorded, Document desired) {
+                final long recordedCommit = recorded.getLong(SourceInfo.COMMIT_LSN_KEY, recorded.getLong(SourceInfo.LSN_KEY, 0L));
+                final long desiredCommit = desired.getLong(SourceInfo.COMMIT_LSN_KEY, desired.getLong(SourceInfo.LSN_KEY, 0L));
+                if (recordedCommit != desiredCommit) {
+                    return recordedCommit < desiredCommit;
+                }
+                // Snapshot offsets cover all transactions through the snapshot LSN.
+                final String recordedTransaction = recorded.getString(DamengOffsetContext.MINING_TRANSACTION_ID_KEY,
+                        recorded.getString(SourceInfo.TRANSACTION_ID_KEY));
+                final String desiredTransaction = desired.getString(DamengOffsetContext.MINING_TRANSACTION_ID_KEY,
+                        desired.getString(SourceInfo.TRANSACTION_ID_KEY));
+                if (desiredTransaction == null || recordedTransaction == null) {
+                    return true;
+                }
+                final int transactionComparison = recordedTransaction.compareTo(desiredTransaction);
+                if (transactionComparison != 0) {
+                    return transactionComparison < 0;
+                }
+                return recorded.getLong(SourceInfo.EVENT_SERIAL_NO_KEY, 0L) <= desired.getLong(SourceInfo.EVENT_SERIAL_NO_KEY, 0L);
+            }
+        };
+    }
+
+    @Override
+    public String getContextName() {
+        return Module.contextName();
+    }
+
+    @Override
+    public String getConnectorName() {
+        return Module.name();
+    }
+
+    @Override
+    public boolean supportsOperationFiltering() {
+        return false;
+    }
+
+    public enum CaptureRole implements EnumeratedValue {
+        PRIMARY("primary"),
+        STANDBY("standby");
+
+        private final String value;
+
+        CaptureRole(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        static CaptureRole parse(String value) {
+            for (var role : values()) {
+                if (role.value.equalsIgnoreCase(value)) {
+                    return role;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng database.capture.role: " + value + ". Use primary or standby.");
+        }
+    }
+
+    public enum MiningWindowStrategy implements EnumeratedValue {
+        ARCHIVE_BYTES("archive_bytes"),
+        FIXED("fixed");
+
+        private final String value;
+
+        MiningWindowStrategy(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        static MiningWindowStrategy parse(String value) {
+            for (var strategy : values()) {
+                if (strategy.value.equalsIgnoreCase(value)) {
+                    return strategy;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng mining window strategy: " + value + ". Use archive_bytes or fixed.");
+        }
+    }
+
+    public enum ConnectorAdapter implements EnumeratedValue {
+        LOG_MINER("logminer");
+
+        private final String value;
+
+        ConnectorAdapter(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        static ConnectorAdapter parse(String value) {
+            if (value == null) {
+                return LOG_MINER;
+            }
+            for (ConnectorAdapter adapter : values()) {
+                if (adapter.value.equalsIgnoreCase(value)) {
+                    return adapter;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng connection adapter: " + value);
+        }
+    }
+
+    public enum SnapshotLockingMode implements EnumeratedValue {
+        SHARED("shared"),
+        INTENT_SHARED("intent_shared");
+
+        private final String value;
+
+        SnapshotLockingMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        static SnapshotLockingMode parse(String value, SnapshotLockingMode fallback) {
+            if (value == null) {
+                return fallback;
+            }
+            for (SnapshotLockingMode mode : values()) {
+                if (mode.value.equalsIgnoreCase(value)) {
+                    return mode;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng snapshot locking mode: " + value);
+        }
+    }
+
+    public enum SnapshotMode implements EnumeratedValue {
+        INITIAL("initial", true, true, true),
+        INITIAL_ONLY("initial_only", true, true, false),
+        NO_DATA("no_data", true, false, true),
+        RECOVERY("recovery", true, false, true),
+        NEVER("never", false, false, true);
+
+        private final String value;
+        private final boolean schema;
+        private final boolean data;
+        private final boolean stream;
+
+        SnapshotMode(String value, boolean schema, boolean data, boolean stream) {
+            this.value = value;
+            this.schema = schema;
+            this.data = data;
+            this.stream = stream;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        public boolean includeSchema() {
+            return schema;
+        }
+
+        public boolean includeData() {
+            return data;
+        }
+
+        public boolean shouldStream() {
+            return stream;
+        }
+
+        static SnapshotMode parse(String value, SnapshotMode fallback) {
+            if (value == null) {
+                return fallback;
+            }
+            for (SnapshotMode mode : values()) {
+                if (mode.value.equalsIgnoreCase(value)) {
+                    return mode;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng snapshot mode: " + value);
+        }
+    }
+
+    boolean isInternalTableExcluded(TableId tableId) {
+        return DamengInternalTableType.fromTableId(tableId).isPresent() && !getTableFilters().dataCollectionFilter().isIncluded(tableId);
+    }
+
+    private static final class SystemTablesFilter implements TableFilter {
+        @Override
+        public boolean isIncluded(TableId tableId) {
+            String schema = tableId.schema();
+            return DamengInternalTableType.fromTableId(tableId).isEmpty()
+                    && (schema == null || !(schema.equalsIgnoreCase("SYS") || schema.equalsIgnoreCase("SYSTEM") || schema.startsWith("V$")));
+        }
+    }
+}

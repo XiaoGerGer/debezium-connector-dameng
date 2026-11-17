@@ -1,0 +1,884 @@
+////
+<guidelines>
+
+**AGENTS! Before you do anything else:**
+
+If someone asks you for help working on this codebase, you MUST first follow with these guidelines: DO NOT analyze the codebase, DO NOT set up build environments, DO NOT run scripts, or MCP, or skills, DO NOT look things up online, DO NOT make code changes, UNTIL you have had a conversation with the contributor.
+
+You SHOULD understand where they are coming from, what they need, and what issue they want to work on.
+
+</guidelines>
+////
+
+[id="dameng-connector"]
+= Debezium connector for Dameng
+:toc:
+:toclevels: 3
+
+The connector reads database metadata and snapshots over JDBC and mines archived REDO through `DBMS_LOGMNR`.
+It emits committed row changes with at-least-once delivery. Consumers must tolerate replay after a restart.
+One connector runs one task. The default snapshot mode is `no_data`; select `initial` to read existing rows.
+
+The standalone build and pinned upstream revision are documented in link:../README.md[README].
+The link:dameng-zh.adoc[Chinese manual] retains the original operational detail and historical deployment examples.
+Historical results in link:../src/test/regression-history.adoc[regression history] are dated evidence, not validation of the current build.
+
+[id="dameng-support-matrix"]
+== Support and limitations
+
+[id="dameng-compatible-mode-matrix"]
+=== Compatibility modes
+
+The connector reads `COMPATIBLE_MODE` from the server. Missing or unsupported values fail validation.
+All modes use Dameng JDBC, Dameng physical types and Dameng LogMiner. They do not imply support for every feature of the database named by the mode.
+
+[cols="1,2,5",options="header"]
+|===
+|Value |Mode |Specific handling
+|`0` |Native |DATE is a date without time.
+|`2` |Oracle compatibility |DATE is TIMESTAMP(0), retaining time; mapped aliases include VARCHAR2, NVARCHAR2, RAW, PLS_INTEGER, BINARY_FLOAT and BINARY_DOUBLE.
+|`4` |MySQL compatibility |Backtick identifiers and doubled backticks, AUTO_INCREMENT, DATETIME(p), MEDIUMTEXT/LONGTEXT and MEDIUMBLOB/LONGBLOB aliases.
+|`7` |PostgreSQL compatibility |TIME/TIMESTAMP WITHOUT TIME ZONE and E string literals. Unquoted names still become uppercase.
+|===
+
+The tested DM 8.1.3.162 build rejects MySQL declarations such as UNSIGNED, JSON, ENUM and ENGINE=InnoDB, and PostgreSQL declarations such as SERIAL, INT4, BYTEA, JSONB and UUID.
+MySQL-mode ALTER uses MODIFY, RENAME COLUMN and ADD; MODIFY COLUMN, CHANGE COLUMN and ADD AFTER are not supported.
+Changing compatibility or lexical settings requires a new capture baseline if affected logs have been generated.
+
+There is no JNI production adapter, XStream, OpenLogReplicator, Oracle RAC/PDB or Flashback support.
+Parallel initial snapshots, blocking snapshots, custom snapshotters, manual transaction discard and manual history-DDL injection are not provided.
+
+[id="dameng-database-version-matrix"]
+=== Database builds and driver
+
+The project uses `com.dameng:DmJdbcDriver18:8.1.3.140`.
+The following builds appear in historical regression records; this is not a claim that every type and topology passed on every build.
+
+[cols="2,4,4",options="header"]
+|===
+|JDBC version |Full server build |Fixture
+|8.1.2.128 |08134283904-20220804-166351-20005 |Historical baseline; standby LogMiner registration fails with -710.
+|8.1.3.162 |03134284194-20240621-232765-20108 |Default `dameng:8.1.3.162-20240621-rev232765` image.
+|8.1.3.162 |03134284194-20240703-234060-20108 |Official pack1 supplementary datatype, database and worker runs.
+|===
+
+Record the complete build, driver, character set and database parameters. A JDBC version alone does not identify a server build.
+Unrecognized versions or failed version reads cause a warning rather than an independent startup failure.
+
+[id="dameng-deployment-mode-matrix"]
+=== Topology and identifiers
+
+`database.capture.role=primary` selects an OPEN NORMAL standalone instance or the OPEN PRIMARY member of a supported primary/standby family.
+A member list supports manual role changes by the DBA. It does not perform promotion or fencing.
+Members must belong to the same physical database family and use `N_EP=1`.
+Explicit standby capture requires a build with standby LogMiner support and a reachable primary for signals and initial snapshot locks.
+
+[[dameng-case-sensitive]]
+`CASE_SENSITIVE=0` normalizes schema, table, column and constraint names to uppercase, including topic and field names; data values are unchanged.
+With `CASE_SENSITIVE=1`, unquoted names become uppercase and double-quoted names retain case. Columns differing only by case within one table are still rejected.
+Filters and snapshot requests use these normalized `schema.table` names. Signal table names are normalized automatically.
+
+[id="dameng-database-setup"]
+== Database preparation
+
+A DBA must configure archiving, logging and the CDC account. The connector does not enable database logging automatically.
+
+[cols="2,2,5",options="header"]
+|===
+|Setting |Required value |Meaning
+|Local archiving |Enabled |Typically `ARCH_INI=1`; the connector validates actual `V$DATABASE.ARCH_MODE`, accepting Y, 1 or ARCHIVE.
+|RLOG_APPEND_LOGIC |2 |Full non-LOB UPDATE/DELETE images; value 1 can contain only keys and changed columns.
+|RLOG_IGNORE_TABLE_SET |0 or 1 |With 0, enable table-level logical logging for every captured table and signal table. The connector warns and continues; it does not verify each table's setting.
+|RLOG_LLOG_COMPRESS |0 when present |Older builds may omit it. Compressed logical logging can omit INSERT values needed by LogMiner.
+|COMPATIBLE_MODE |0, 2, 4 or 7 |Selects the supported database profile.
+|NUMBER_MODE |0 or 1 |Validated and recorded in all modes. Physical decimal FLOAT/REAL/DOUBLE PRECISION uses decimal conversion.
+|FLOAT_MODE |0 or 1 in modes 2, 4, 7 |Validated and recorded in those modes; native mode does not independently constrain it.
+|ORA_DATE_FMT |0 or 1 in mode 2 |Ignored outside Oracle compatibility mode.
+|MY_STRICT_TABLES |0 or 1 in mode 4 |Recorded in the compatibility signature. Captures actually stored values.
+|BACKSLASH_ESCAPE |0 or 1 |Controls historical DDL literals and comments. Native mode also detects the actual raw/escaped behavior of the server build.
+|NESTED_C_STYLE_COMMENT |0 or 1 |Controls whether block comments nest.
+|CASE_SENSITIVE |0 or 1 |Read through `SF_GET_CASE_SENSITIVE_FLAG()`.
+|IDENTIFIER_MODE |Absent, 0 or 1 |Absent/0 preserves quoted case; 1 uppercases it. Explicit settings have parser-level coverage and need target-database verification.
+|===
+
+`LENGTH_IN_CHAR` changes the unit of declared VARCHAR length; it is neither read nor included in the compatibility signature.
+When `RLOG_IGNORE_TABLE_SET=0`, use the vendor's procedure for the installed build, for example:
+
+[source,sql]
+----
+ALTER TABLE APP.ORDERS ADD LOGIC LOG;
+----
+
+Enable this before capture, including for an automatically created signal table. Enabling it later cannot recover already missing changes.
+The connector records lexical and identifier settings in the offset's `compatibility_signature` and checks them during recovery and mining.
+Changing a setting and changing it back between checks cannot be detected. If affected logs were generated, matching current settings alone does not make replay safe.
+
+[source,sql]
+----
+SELECT PARA_NAME, PARA_VALUE FROM V$DM_INI
+WHERE UPPER(PARA_NAME) IN (
+  'ARCH_INI', 'RLOG_APPEND_LOGIC', 'RLOG_IGNORE_TABLE_SET', 'RLOG_LLOG_COMPRESS',
+  'COMPATIBLE_MODE', 'NUMBER_MODE', 'FLOAT_MODE', 'ORA_DATE_FMT',
+  'MY_STRICT_TABLES', 'BACKSLASH_ESCAPE', 'NESTED_C_STYLE_COMMENT', 'IDENTIFIER_MODE'
+) ORDER BY PARA_NAME;
+SELECT ARCH_MODE FROM V$DATABASE;
+SELECT SF_GET_CASE_SENSITIVE_FLAG();
+SELECT MODE$, STATUS$ FROM V$INSTANCE;
+SELECT PATH, ARCH_LSN, CLSN FROM V$ARCH_FILE WHERE PATH IS NOT NULL ORDER BY ARCH_LSN;
+----
+
+Only archived logs are mined. The current log tail adds latency until it is archived.
+Retain continuous archives covering the oldest unfinished transaction, connector lag, outages and recovery time.
+Archive-space limits can delete old files; a missing required range stops capture instead of being skipped.
+The test fixture's 64 MiB archive files and 1 GiB space cap are not production sizing advice.
+
+=== CDC account
+
+The following permissions have been used with the documented DM8 builds; they are a verified set, not a proven minimum.
+Replace the example names and password according to the target database's policy.
+
+[source,sql]
+----
+CREATE USER CDC_USER IDENTIFIED BY "Replace_With_Strong_Password_123!";
+GRANT CREATE SESSION TO CDC_USER;
+GRANT SOI TO CDC_USER;
+GRANT VTI TO CDC_USER;
+GRANT EXECUTE ON DBMS_LOGMNR TO CDC_USER;
+GRANT SELECT ON APP.CUSTOMERS TO CDC_USER;
+GRANT SELECT ON APP.ORDERS TO CDC_USER;
+----
+
+SOI and VTI provide broad system catalog and dynamic-view access. DBA and SELECT ANY TABLE are not required by this example.
+The baseline build rejects direct object grants on SYS.SYSOBJECTS and SYS.SYSCONS; do not substitute unverified grants.
+Discovery uses the account's visible user tables. An include expression does not grant visibility or SELECT rights.
+The connector logs selected schema/data tables and warns when an include expression matches no visible table; the warning can also mean a future table, naming mismatch or another filter.
+
+Creating a user also creates a same-name schema. If that account creates a signal table in its own schema, grant the necessary own-schema permissions, for example CREATE TABLE, ALTER TABLE, DROP TABLE and SELECT/INSERT/UPDATE/DELETE TABLE.
+Otherwise a DBA can create the signal table and grant its object permissions as described below.
+
+=== Built-in filtering and unknown objects
+
+With `table.ignore.builtin=true`, SYS, SYSTEM and schemas starting with V$ are excluded, as are case-insensitive table prefixes MTAB$_, MLOG$_ and BMJ$_ in any schema.
+Include expressions do not override this filtering. Catalog-designated system tables are never enabled by turning the name filter off.
+Temporary and external tables maintain lifecycle metadata but do not produce snapshot or CDC rows.
+Internal materialized-view and bitmap-index tables must not be used as signal tables.
+
+Schema history is the primary source of object identity and column layout.
+For an unknown object, after closing the mining result set and LogMiner session, the connector reuses its main JDBC connection to query current identity.
+Excluded identities require no column lookup. A captured business table with missing history can load current metadata, check object identity before and after the read, and persist it through the normal schema-change path before processing the original row.
+Role, family identity and compatibility settings are checked around this operation. Existing historical definitions are not overwritten and the consumption position is not reset.
+
+This fallback warns because current metadata cannot reconstruct historical layouts. Object IDs do not detect every intervening ALTER, rename or ID reuse.
+Deleted objects, mismatched identity and failed queries stop processing with the failed row replayable.
+Excluded IDs are not cached for future logs. Already-deleted internal objects may therefore still stop historical replay.
+Keep the default broad schema-history retention to reduce dependence on current metadata.
+
+[id="dameng-deployment"]
+== Installation and configuration
+
+Build the standalone package as described in link:../README.md[README], extract it into a dedicated worker plugin directory and restart every worker that can run the task.
+Do not mix plugin generations in one directory. The package contains the JDBC driver and runtime dependencies.
+The Docker tooling builds and exports an image; it does not publish or deploy it. Use `bash docker/build-image.sh --help` from the repository root.
+Its retained `apache/kafka:3.9.1` base default is not a compatibility certification for the current build; select a runtime validated with your connector artifact.
+Historical Kafka 2.0 instructions in the Chinese manual refer to the original deployment and are not a current standalone support claim.
+
+Use a dedicated single-partition schema-history topic and preserve its complete history.
+The history topic is distinct from Connect config/offset/status topics and from the public schema-change topic.
+Worker connection credentials, business producers and schema-history clients each need their own appropriate Kafka settings.
+
+Check plugin discovery:
+
+[source,shell]
+----
+curl -fsS http://localhost:8083/connector-plugins
+----
+
+Create the connector with a POST body such as the following. For the file placeholder, configure the worker's FileConfigProvider and mount the corresponding secret file.
+`log.mining.buffer.spill.path` must be writable by the worker account.
+
+[source,json]
+----
+{
+  "name": "dameng-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.dameng.DamengConnector",
+    "tasks.max": "1",
+    "topic.prefix": "dameng",
+    "database.hosts": "dm.example.com:5236",
+    "database.user": "CDC_USER",
+    "database.password": "${file:/secrets/dameng.properties:password}",
+    "database.dbname": "DAMENG",
+    "table.include.list": "APP\\.CUSTOMERS,APP\\.ORDERS,APP\\.DBZ_SIGNAL",
+    "signal.data.collection": "APP.DBZ_SIGNAL",
+    "snapshot.mode": "no_data",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "dameng-schema-history",
+    "log.mining.buffer.spill.path": "/var/lib/dameng-spill"
+  }
+}
+----
+
+POST to `/connectors`. PUT to `/connectors/dameng-cdc/config` uses only the complete config object, without the outer name/config wrapper; it is not a partial patch.
+Configuration validation uses `/connector-plugins/io.debezium.connector.dameng.DamengConnector/config/validate`, not a `dameng` shorthand.
+Validation does not replace task-start checks of archives, roles and history.
+
+Check both connector and task status. Commit INSERT/UPDATE/DELETE in a test table and inspect keys, before/after images and operation codes.
+Verify restart recovery including DDL/DML while stopped. A RUNNING connector can still have a FAILED task.
+Pausing does not delete offsets and need not immediately release all resources. Use the runtime's stop API when needed.
+
+[id="dameng-snapshots"]
+== Snapshots and capture scope
+
+[cols="2,4,4",options="header"]
+|===
+|Mode |Without a completed snapshot offset |With a completed snapshot offset
+|`no_data` (default) |Read schema, select a current LSN and stream; no existing-row events. |Resume the saved position, requiring its archives.
+|`initial` |Read schema and existing rows, then stream. |Resume; do not automatically resnapshot.
+|`initial_only` |Read schema and existing rows, without continuous CDC. |Not a continuous capture mode.
+|`never` |Legacy alias of no_data, including a schema baseline. |Same as no_data.
+|`recovery` |Rejected without an existing offset. |Rebuild history from current schema while retaining the saved consumption position.
+|===
+
+An interrupted initial snapshot can restart and repeat rows.
+The connector discovers and locks schema-capture tables, chooses `V$RLOG.CUR_LSN`, reads schema and optionally scans rows.
+It checks for newly matching tables after choosing the boundary; if needed, it acquires their locks and reselects the boundary before a final check.
+Later tables are handled by the DDL stream. Rollback ends the read-only snapshot transaction and releases its locks; it does not roll back business transactions.
+
+The default `snapshot.locking.mode=shared` drains existing writers and prevents writes while locks are held.
+There is no Oracle AS OF SCN query. `snapshot.max.duration.ms` includes lock waits, metadata/data queries, queue waits and rollback.
+Timeout interrupts the snapshot and requests JDBC abort; actual disconnection and lock release depend on the database and driver.
+`snapshot.max.threads` must be 1. `snapshot.lock.timeout.ms` is not wired into Dameng LOCK TABLE; use query timeout and the total budget.
+
+Explicit `intent_shared` uses INTENT SHARE locks, permitting ordinary DML and CREATE INDEX while conflicting definition changes wait.
+It does not drain existing write transactions. Operations before the chosen boundary can be omitted even if their transaction commits later.
+The `snapshot_baseline_lsn` offset retains that boundary across restart and reconstruction.
+`initial + intent_shared` uses ordinary SELECT, so concurrent changes can cause overlap, missing rows or ordering anomalies; it is not a consistent full snapshot.
+All initial/schema-recovery modes obey the explicit lock choice. Changing it later does not restore previously omitted operations.
+
+=== Filters and retained schema
+
+Schema/table filters govern capture; table expressions match `schema.table` and column expressions match `schema.table.column`.
+Corresponding include/exclude options cannot be combined. Escape literal dots in JSON, for example `APP\\.CUSTOMERS`.
+`snapshot.include.collection.list` narrows initial data rows only. Snapshot SELECT overrides also affect only initial rows, not subsequent CDC.
+
+By default, `schema.history.internal.store.only.captured.tables.ddl=false` records all eligible visible table definitions, including tables outside data filters, and keeps their DDL current.
+The default snapshot lock scope includes those schema-capture tables.
+Setting it true narrows initial schema; known tables renamed outside the capture scope still retain subsequent DDL for a possible rename back.
+`schema.history.internal.store.only.captured.databases.ddl` can further narrow schema capture by database/schema filters.
+
+[id="dameng-capture-scope-changes"]
+=== Adding and removing captured tables
+
+Submit the complete updated configuration and restart while retaining connector identity, offsets, history and required archives.
+An added table resumes from the existing consumption position using historical schema, replayable CREATE DDL or the qualified online fallback described above.
+There is no table-specific activation LSN. For example, adding B when the saved position is 100 and the database is at 200 resumes processing from 100 for both old tables and B.
+
+Removing a table stops further output, including unsent backlog, and removes its incremental-snapshot progress while preserving other tables' progress.
+Already published events are not retracted. Re-adding a table cannot replay changes already passed while it was excluded.
+`initial` does not automatically backfill an added table; request an incremental snapshot for current rows.
+Backfill cannot restore historical deletes, intermediate updates or original transaction history.
+Schema recovery is safe only when current definitions are compatible with all pending logs.
+
+[id="dameng-signals"]
+=== Incremental snapshots and signals
+
+Incremental snapshots scan primary-key chunks, using source-table low/high watermarks and CDC deduplication before emitting remaining `op=r` rows.
+Progress is saved in offsets. A high watermark must be observed before cached rows can be considered final.
+This is not a single database-wide point-in-time view and does not hold the initial snapshot's long-lived shared table locks.
+Keep schema stable: `incremental.snapshot.allow.schema.changes` must be false. Acceptance is based on tables with declared primary keys.
+
+Configure one stable `signal.data.collection=APP.DBZ_SIGNAL` per connector and include it in capture and logical logging.
+At startup, the connector creates it if absent; its schema must exist. An existing table must have exactly three VARCHAR/NVARCHAR columns in ID, TYPE, DATA order.
+Creation, access or shape-validation failure stops startup. Precreate it if the connector account should not have DDL permission:
+
+[source,sql]
+----
+CREATE TABLE APP.DBZ_SIGNAL (
+  ID VARCHAR(64) PRIMARY KEY,
+  TYPE VARCHAR(64) NOT NULL,
+  DATA VARCHAR(2000)
+);
+GRANT SELECT, INSERT, DELETE ON APP.DBZ_SIGNAL TO CDC_USER;
+
+INSERT INTO APP.DBZ_SIGNAL VALUES (
+  'customers-snapshot-001', 'execute-snapshot',
+  '{"type":"incremental","data-collections":["APP.CUSTOMERS"]}'
+);
+COMMIT;
+----
+
+Use unique signal IDs. Observe logs, notifications, metrics and row events rather than treating the signal INSERT as completion.
+`insert_insert` inserts both watermarks; `insert_delete` closes by deletion and requires DELETE permission.
+A `stop-snapshot` signal with `{"type":"incremental"}` stops the current request without retracting rows.
+Pause/resume and Kafka/JMX/file input channels are framework facilities with less module-level end-to-end coverage; validate the target deployment.
+Even another trigger channel still needs a source signal table for Dameng watermarks.
+
+[id="dameng-incremental-snapshot-additional-conditions"]
+For a filtered backfill, add `"additional-conditions":[{"data-collection":"APP.CUSTOMERS","filter":"ID >= 1000 AND ID < 2000"}]` to the execute-snapshot JSON.
+The filter is a Dameng condition expression without WHERE, a complete SELECT or a trailing semicolon.
+Double SQL quotes when embedding JSON in an SQL string. Conditions affect only this backfill, not later CDC, and do not delete existing downstream rows.
+Additional-condition deployment semantics require target-environment verification; overlapping requests can repeat rows.
+
+[id="dameng-logminer"]
+== Log mining and resource budgets
+
+Only archived REDO is read. LSN span is neither a row count nor a byte count.
+The default `archive_bytes` strategy chooses complete forward archive files by `V$ARCH_FILE.LEN`, with a soft budget of 64 MiB.
+File sizes include preallocation and previously scanned portions. One file, shared boundaries and transaction reconstruction can exceed the budget.
+The connector processes the available tail without waiting to fill a budget. Missing/nonpositive file lengths, gaps, mixed sources and invalid overlaps stop capture.
+The alternative `fixed` strategy advances by `log.mining.batch.size` LSN units.
+
+Unfinished transactions remain across windows and pin the oldest safe replay position.
+A cross-window commit/rollback can reconstruct transactions from that position, excluding rolled-back operations before publication in commit order.
+SAVEPOINT outcomes are supported. Spill files do not eliminate the need for old archives.
+
+The transaction cache defaults to 64 MiB of estimated memory, one million retained transaction metadata entries, 1 GiB of per-run spill files and 16 MiB of UTF-16 payload per SQL_REDO statement.
+It spills the largest resident transactions; metadata cannot spill and exhaustion stops processing.
+The SQL limit covers all continuous fragments and is checked before concatenation. JDBC and temporary copies require additional memory.
+These budgets do not include the event queue or the whole JVM heap.
+
+Each run creates a private `dameng-tx-*` directory under `log.mining.buffer.spill.path`. Files contain source data and do not provide restart recovery.
+After a forced termination, remove only directories known to belong to terminated runs. Disk quotas exclude other tasks and abandoned files.
+I/O and checksum errors stop capture rather than dropping transactions.
+Deprecated `log.mining.buffer.max.bytes` and `log.mining.buffer.max.records` are ignored with a warning.
+Removed adaptive-window options are rejected; use `log.mining.window.strategy=fixed` for a fixed window.
+
+Missing required LogMiner fields, SQL fragments, invalid fragment ordering and conflicting identities fail the window.
+Unsupported operations can be filtered only when their excluded-table identity is known.
+Parse diagnostics include LSN, XID, object ID and full assembled SQL_REDO; protect logs like source data.
+`DATA_OBJV#` is diagnostic metadata, not a replacement for historical schema.
+
+Tune from phase metrics: forward mining and archive availability, then reconstruction and long transactions, then dispatch/queue/worker/producer bottlenecks.
+Larger queues absorb bursts but do not fix sustained downstream throughput shortfalls.
+
+[id="dameng-ddl"]
+== DDL and schema evolution
+
+Supported DDL updates schema history before subsequent rows are decoded.
+Unknown syntax or unsafe schema transitions fail by default and will recur at the same position after restart.
+
+[cols="2,5,5",options="header"]
+|===
+|Operation |Handling |Limits
+|CREATE/ALTER/RENAME/DROP |Column order, types, defaults, constraint names and object IDs; column rename updates primary keys. Conditional table/column operations and grouped ADD are supported. |Unknown clauses, generated/virtual columns, HUGE and distributed tables are rejected.
+|Keys and constraints |Primary-key changes update event keys; UNIQUE, foreign-key and CHECK names are retained for later DDL. |UNIQUE is not automatically an event key; DISABLE and enable/disable transitions are unsupported.
+|Whole-table TRUNCATE |Retains schema; can emit `op=t`. |Skipped by default with `skipped.operations=t`; TRUNCATE CASCADE is rejected.
+|Row-store partitions |HASH/RANGE/LIST, interval, multiple subpartition levels and templates; DML uses the root table. |Row moves from split/merge still produce INSERT/DELETE; no movement deduplication.
+|CTAS |Reads the target's online dictionary; copied rows are captured from INSERT logs. |Target must still exist with a compatible creation-time definition. Identity checks cannot detect all intervening ALTER operations.
+|LIKE |Copies source-history columns and nullability. |Does not copy primary keys, defaults, identity or comments; source history must exist.
+|Temporary/external tables |Tracks identity, type and lifecycle only. |No data snapshots, incremental rows, CDC rows or schema notifications. External-table handling is limited to create/drop/rename; ALTER, TRUNCATE and LIKE-derived columns are rejected.
+|Materialized views/logs |Recognizes ordinary DDL and filters existing internal objects by online identity. |Deleted internal objects can stop replay. FOR ON PREBUILT TABLE is rejected; prebuilt tables require explicit exclusion.
+|===
+
+On the tested DM 8.1.3.162 build, dropping a primary key makes its columns nullable; dropping one column of a composite key removes that key while keeping the remaining columns non-nullable.
+A bare ENCRYPT marker is recognized, but algorithm/key/MANUAL options are not; encrypted-column CDC needs deployment verification.
+WITH/WITHOUT/TRUNCATE ADVANCED LOG is unsupported.
+
+Recognized non-row-schema DDL is skipped as NO_TABLE_CHANGE: indexes, ordinary views, sequences, synonyms, grants, comments, users/empty schemas, directories, domains, profiles, contexts, libraries, statistics, links, operators, tablespaces and program definitions.
+Lexical structure, balanced delimiters and statement boundaries are still validated so trailing table DDL cannot be swallowed.
+COMMENT does not refresh event-schema comments. Recognizing a type definition does not mean object-valued columns are supported.
+Embedded objects in CREATE SCHEMA, DROP CLASS BODY CASCADE and compound table DDL in one redo statement are unsupported.
+RESTORE TABLE may replace data without per-row redo. Multiple LOCAL archive destinations can register duplicates and fail with -2848.
+
+=== Operations without complete row images
+
+The following flags default to false and are independent of the generic DDL skip policy:
+
+[cols="3,5",options="header"]
+|===
+|Option |Explicitly ignored operation and consequence
+|`partition.drop.ignore` |DROP/TRUNCATE PARTITION or SUBPARTITION, including TRUNCATE TABLE PARTITION. Does not synthesize downstream deletes.
+|`partition.exchange.ignore` |Fully parsed EXCHANGE PARTITION/SUBPARTITION with both identities established. Does not synthesize exchanged rows.
+|`cascade.drop.ignore` |DROP USER/SCHEMA/DOMAIN/TYPE/CLASS CASCADE. Retains the old model; dependent objects can cross schemas.
+|===
+
+EXCHANGE is filtered directly only if neither side is relevant to capture or history maintenance.
+An unqualified WITH TABLE target must be resolved from object identity and historical name, not guessed from the root-table schema. Unresolved identities always fail.
+The cascade flag does not permit TRUNCATE CASCADE or DROP CLASS BODY CASCADE; DROP TABLE CASCADE CONSTRAINTS follows ordinary drop-table handling.
+Ignoring warns with SQL and position. Once offsets pass the operation, disabling the flag does not repair downstream state or history.
+
+`schema.history.internal.skip.unparseable.ddl=true` skips streaming DDL parsing/model-planning errors, keeps the previous model and writes no history for that statement.
+It does not replace history with current JDBC metadata. It does not skip missing SQL, invalid captured-object IDs, CTAS dictionary failures, DML parsing, archive or identity errors, or bypass the three dedicated policies.
+Skipping a real schema change can produce wrong column/type interpretations or later failures; it is not automatic recovery.
+
+=== Literals and defaults
+
+Double-quote escaping, N/Q strings, line/block comments and hints are supported; block nesting follows the database setting.
+MySQL executable/# comments and PostgreSQL dollar strings are not treated as native syntax.
+DDL literals/comments follow actual BACKSLASH_ESCAPE semantics. JDBC defaults and LogMiner DML are not decoded twice; bound literal backslashes are preserved.
+The tested builds differ in native backslash behavior and grouped ADD default rewriting; the connector detects the native profile.
+
+Constant defaults are converted by historical type, including supported DATE/TIME/TIMESTAMP literals and ISO forms of TO_DATE/TO_TIMESTAMP/TO_TIMESTAMP_TZ.
+CURRENT_TIMESTAMP, SYSDATE and unsupported expressions are not evaluated or assigned guessed schema defaults.
+Odd-length hexadecimal constants are left-zero-padded; fixed BINARY values are right-zero-padded.
+Parser coverage and real-database executability are separate in link:../src/test/testing.adoc[testing notes].
+
+[id="dameng-data-types"]
+== Data types
+
+Mappings follow actual JDBC physical types and historical DDL, not merely a declaration's name in another database.
+A Connect BYTES value may serialize as Base64; decimal JSON also depends on the worker converter.
+
+[cols="3,2,5",options="header"]
+|===
+|Dameng type |Connect type |Meaning
+|BOOLEAN, single-bit BIT |BOOLEAN |Boolean value; validate other BIT declarations against physical metadata.
+|TINYINT, SMALLINT |INT8, INT16 |Database-accepted integer range.
+|INT/INTEGER, BIGINT |INT32, INT64 |Avoid lossy consumer floating-point representations of BIGINT.
+|Physical REAL, BINARY_FLOAT |FLOAT32 |LogMiner may lose precision as described below.
+|Physical DOUBLE/FLOAT, BINARY_DOUBLE |FLOAT64 |FLOAT(p) physical mapping depends on mode/settings.
+|Fixed DECIMAL/NUMERIC/NUMBER |BYTES |Default Decimal logical type with scale; string/double modes use STRING/FLOAT64.
+|Unbounded decimal, physical decimal FLOAT/REAL/DOUBLE PRECISION with NUMBER_MODE=1 |STRUCT |VariableScaleDecimal in precise mode, containing scale and unscaled bytes. Old native REAL can still be physical binary REAL.
+|Character types |STRING |CHAR/NCHAR padding is restored from historical byte length and character set.
+|BINARY, VARBINARY, RAW |BYTES |Optional Base64, URL-safe Base64 or hex text. Only binary columns interpret `'0x'` as empty bytes.
+|DATE in modes 0/4/7 |INT32 |Days from the epoch by default; explicit isostring uses IsoDate with Z suffix.
+|DATE in mode 2 |INT64 |Physical TIMESTAMP(0), preserving time as epoch milliseconds by default.
+|TIME(p) |INT32/INT64 |Time, MicroTime or NanoTime according to precision; isostring uses IsoTime.
+|TIMESTAMP/DATETIME |INT64/STRING |Default milliseconds up to precision 3, microseconds at 4..6, IsoTimestamp text at 7..9.
+|TIME WITH TIME ZONE |STRING |ZonedTime normalized to UTC, without a date added when crossing midnight.
+|TIMESTAMP WITH TIME ZONE |STRING |ZonedTimestamp normalized to UTC; does not retain original offset spelling.
+|INTERVAL |STRING |Interval logical type version 1; retains units and exact decimal seconds.
+|CLOB/TEXT, BLOB and MySQL-mode aliases |STRING/BYTES |Full snapshot values; unavailable streaming LOBs use the configured placeholder.
+|TIMESTAMP WITH LOCAL TIME ZONE |STRING |Lossy UTC assumption described below.
+|Unmapped objects/collections |Unsupported |Schema error. ROWID has JDBC/CRUD baseline coverage but historical CREATE remains rejected.
+|===
+
+`decimal.handling.mode=precise` retains fixed or variable scale. `double` can lose significant digits.
+VariableScaleDecimal has no schema default because of Connect Struct-default limitations; actual stored default values are still captured and expressions remain in history.
+`time.precision.mode=adaptive` is the framework default. Native `isostring` remains available; custom text formatting belongs in an SMT or downstream processing.
+In adaptive/adaptive_time_microseconds modes, TIMESTAMP(7..9) uses IsoTimestamp. Explicit nanoseconds still has the INT64 range limit; connect mode retains only milliseconds.
+Unsupported temporal literal formats fail. INTERVAL supports 13 qualifiers, leading precision 1..9 and fractional seconds 0..6 without approximate month/day conversion or silent rounding.
+
+=== Known consistency limits
+
+Binary REAL/FLOAT/DOUBLE LogMiner text can round to six decimal places, collapse distinct values or turn a small nonzero number into zero.
+A converter cannot restore bits absent from the log. Physical decimal storage selected by NUMBER_MODE=1 follows decimal conversion instead.
+Old 8.1.2.128 TIME WITH TIME ZONE loses fractional seconds; tested 8.1.3.162 TIME(1..6) WITH TIME ZONE passed its strict historical matrix.
+Streaming OUT_BLOB/OUT_CLOB and omitted LOB before images use `unavailable.value.placeholder`; explicit SQL NULL remains null.
+Kafka 4.3.0 schema-enabled JsonConverter historical tests observed negative zero becoming positive zero and NaN becoming zero on decode; distinguish raw Connect values from serialization behavior.
+Input boundaries for huge numbers, multibyte CHAR and NaN depend on the exact database build/driver.
+
+[[dameng-local-time-zone-policy]]
+=== TIMESTAMP WITH LOCAL TIME ZONE
+
+Snapshots use a UTC JDBC session; streaming labels LogMiner's local text as UTC because original session-zone information is unavailable.
+A Z suffix therefore does not guarantee the true instant or equality across snapshot and streaming.
+For example, writing `2000-02-29 12:34:56.123456` in a +05:45 session produced snapshot `2000-02-29T06:49:56.123456Z` but streaming `2000-02-29T12:34:56.123456Z` in the tested fixture.
+Avoid relying on this field for exact instants or cross-phase time deduplication. A fixed external zone cannot recover all historical UPDATE/DELETE before values.
+This policy does not apply to ordinary TIMESTAMP or TIMESTAMP WITH TIME ZONE.
+
+Custom `converters` map database values to Connect values; worker converters serialize them and SMTs transform records.
+Validate keys, schemas, defaults and both capture phases when customizing; none can recover information already missing from LogMiner.
+
+[id="dameng-topics"]
+== Topics and events
+
+For `topic.prefix=dameng`, the default data topic is `dameng.APP.CUSTOMERS`, preserving normalized schema/table case.
+Public schema changes use `dameng`, transaction metadata uses `dameng.transaction`, and enabled heartbeats use `__debezium-heartbeat.dameng`.
+The internal history topic is explicitly configured, exclusive to this connector, single-partition and completely retained without compaction.
+It cannot be replaced with public schema-change notifications. Connect's config/offset/status topics belong to the worker cluster and are separate.
+Topic routing SMTs do not redirect internal history. Extra topic partitions do not create additional Dameng tasks or global ordering.
+
+[id="dameng-events"]
+=== Record content
+
+A primary key supplies the event key; composite keys include all key columns. UNIQUE constraints do not automatically become keys.
+Ordinary snapshots/CDC support tables without a primary key and use a null key by default.
+`message.key.columns` can choose a business key, whose uniqueness, non-nullness and stability are the user's responsibility; this does not establish a database key or validated incremental-snapshot support.
+
+The default envelope contains `before`, `after`, `source`, `op`, processing timestamps and optional `transaction` metadata.
+A null row image differs from a null value in one column. JSON converters with schemas enabled add an outer schema/payload wrapper.
+
+[cols="2,5",options="header"]
+|===
+|Field |Meaning
+|`op=r/c/u/d/t` |Snapshot read, insert, update, delete or truncate. A snapshot read is not a new INSERT.
+|`source.name`, `source.db` |Logical topic prefix and configured database name; neither changes JDBC routing.
+|`source.schema`, `source.table` |Historical table identity.
+|`source.lsn` |Safe replay start, possibly pinned by a long transaction; not the maximum scanned LSN.
+|`source.change_lsn`, `source.commit_lsn` |This operation's log position and its transaction's commit position.
+|`source.event_serial_no` |Zero-based transaction record index, possibly non-contiguous after filtering; not a Kafka offset or transaction.total_order.
+|`source.transaction_id` |Dameng transaction ID; do not assume permanent uniqueness across database rebuilds.
+|`source.snapshot` |true, last, incremental or false according to phase.
+|`source.ts_ms`, envelope timestamps |Source time and connector processing time, not downstream acknowledgement time.
+|===
+
+An UPDATE has before/after images; DELETE has only before; CREATE/READ has only after; TRUNCATE has neither and a null key.
+TRUNCATE is skipped by default. Set `skipped.operations` to an empty string to enable it.
+Keyed deletes normally emit a subsequent Kafka null-value tombstone. It has no envelope.
+A key change emits old-key delete, optional tombstone and new-key create, with framework association headers. Restart can repeat part of this sequence.
+
+Public schema-change values include source, databaseName, schemaName, ddl and structured tableChanges; their key contains databaseName.
+Initial schema events may have empty DDL text. Internal history additionally preserves recovery positions and Dameng object properties; do not reconstruct it manually from public events.
+
+`provide.transaction.metadata=true` enables BEGIN/END records and per-event id, total_order and data_collection_order (both orders are one-based).
+Counts describe captured data events rather than every row in the original database transaction; tombstones are not new row changes.
+BEGIN/END timestamps use different source/processing paths and their difference is not database transaction duration.
+Metadata permits downstream reconstruction but does not make multiple topics atomically visible.
+
+[id="dameng-configuration"]
+== Configuration reference
+
+Use connector options inside the REST config object. Worker environment properties do not automatically become connector options.
+Defaults below describe the migrated connector; the generated connector descriptor lists the framework fields inherited by the pinned build.
+Byte budgets are bytes; time units follow each option's name.
+
+[cols="3,2,5",options="header"]
+|===
+|Option |Default |Purpose
+|connector.class |Required |`io.debezium.connector.dameng.DamengConnector`.
+|tasks.max |1 |Only one task is accepted.
+|topic.prefix |Required |Stable source and topic namespace; preserve during recovery.
+|database.hosts |Required |Comma-separated host:port candidates with explicit ports; IPv6 uses [address]:port. Order is not a role designation.
+|database.user |Required |CDC account.
+|database.password |Unset |Use a worker configuration provider where appropriate.
+|database.dbname |DAMENG |Event database label, not a schema/PDB/router selection.
+|database.capture.role |primary |primary or standby only.
+|database.connection.adapter |logminer |Only supported adapter.
+|database.socket.timeout.ms |600000 |Positive JDBC socket timeout; do not also set database.socketTimeout.
+|database.query.timeout.ms |600000 |Statement timeout, rounded up to seconds; 0 disables only statement timeout.
+|database.standby.replay.timeout.ms |60000 |Positive snapshot/watermark replay-wait budget.
+|schema.include.list / schema.exclude.list |Unset |Mutually exclusive schema regular-expression lists.
+|table.include.list / table.exclude.list |Unset |Mutually exclusive schema.table regular-expression lists.
+|table.ignore.builtin |true |Built-in system/internal name filtering; disabling does not enable internal-object CDC.
+|column.include.list / column.exclude.list |Unset |Mutually exclusive schema.table.column patterns; retain needed key columns.
+|message.key.columns |Unset |For example APP.CUSTOMERS:ID,REGION;APP.ORDERS:ID.
+|snapshot.mode |no_data |initial, initial_only, no_data, recovery or legacy never.
+|snapshot.locking.mode |shared |shared or intent_shared; no none mode.
+|snapshot.max.duration.ms |600000 |Positive whole-snapshot budget including cleanup.
+|snapshot.max.threads |1 |Other values are rejected.
+|snapshot.include.collection.list |Selected tables |Narrows initial data rows only.
+|snapshot.select.statement.overrides |Unset |Table list, with per-table complete SQL in snapshot.select.statement.overrides.<schema.table>.
+|snapshot.fetch.size |Effective 2000 |JDBC fetch hint; not a driver memory guarantee.
+|snapshot.delay.ms / streaming.delay.ms |0 / 0 |Framework phase delays.
+|query.fetch.size |2000 |LogMiner fetch hint; not a transaction/window size.
+|log.mining.window.strategy |archive_bytes |archive_bytes or fixed.
+|log.mining.window.max.bytes |67108864 |Soft whole-file forward budget for archive_bytes.
+|log.mining.batch.size |1000 |LSN span for fixed mode only.
+|log.mining.buffer.memory.bytes |67108864 |Estimated transaction-memory threshold; not total heap.
+|log.mining.buffer.spill.path |java.io.tmpdir |Parent of private per-run spill directories.
+|log.mining.buffer.spill.max.bytes |1073741824 |Per-run currently encoded spill-file limit.
+|log.mining.buffer.max.transactions |1000000 |Retained transaction metadata, including committed transactions awaiting dispatch.
+|log.mining.buffer.max.sql.bytes |16777216 |UTF-16 payload cap per complete SQL_REDO, two bytes per Java character.
+|partition.drop.ignore / partition.exchange.ignore / cascade.drop.ignore |false |Dedicated lossy DDL policies described above.
+|decimal.handling.mode |precise |precise, string or double.
+|time.precision.mode |adaptive |Framework temporal modes, including native isostring.
+|binary.handling.mode |bytes |bytes, base64, base64-url-safe or hex.
+|unavailable.value.placeholder |\_\_debezium_unavailable_value |Incomplete streaming LOB marker; not SQL NULL. Binary markers are UTF-8 encoded before binary handling.
+|include.schema.changes |true |Public schema events; false does not disable internal history.
+|include.schema.comments |false |Available comments; streaming COMMENT does not refresh descriptions.
+|tombstones.on.delete |true |Null-value record after a keyed delete.
+|skipped.operations |t |Skipped data operations, without disabling DDL history maintenance.
+|provide.transaction.metadata |false |Transaction boundary records and event ordering metadata.
+|signal.data.collection |Unset |Stable schema.table source signal table; checked/created at startup.
+|signal.enabled.channels |source |Input channels; source is the primary module-verified flow.
+|signal.poll.interval.ms |5000 |Framework channel interval; source signals still wait for log mining.
+|incremental.snapshot.chunk.size |1024 |Maximum rows per chunk.
+|incremental.snapshot.allow.schema.changes |false |Must remain false.
+|incremental.snapshot.watermarking.strategy |insert_insert |insert_insert or insert_delete; deletion needs permission.
+|notification.enabled.channels |Unset |For example log, jmx or sink.
+|notification.sink.topic.name |Unset |Topic for the enabled sink notification channel.
+|===
+
+Removed connection inputs `database.hostname`, `database.port`, `database.failover.hosts` and `database.standby.hosts` are rejected. Use database.hosts and an explicit capture role.
+The test harness's `dameng.hostname` and related system properties are separate from connector configuration.
+
+Framework column masks/truncation, salted hashes (including hash.v2), source-type propagation and schema/field-name adjustment are available through their standard options.
+They change emitted schemas or values, not historical physical column positions.
+Common database.include/exclude inputs do not replace Dameng schema/table filters or select another database.
+
+Inherited parallel/configuration_based/custom snapshotter fields do not enable those unsupported modes.
+`snapshot.query.mode=custom` is a separately implemented query SPI, not a custom snapshotter; validate any supplied implementation.
+`snapshot.lock.timeout.ms` does not control Dameng locks, and row-count snapshot ordering is not a verified Dameng tuning facility.
+
+=== Queue, errors and framework extensions
+
+[cols="3,2,5",options="header"]
+|===
+|Option |Default |Purpose
+|max.batch.size |2048 |Events returned by one task poll.
+|max.queue.size |8192 |Queue record cap; must exceed max.batch.size.
+|max.queue.size.in.bytes |0 |Optional estimated queue-byte cap, separate from transaction memory.
+|poll.interval.ms |500 |Queue polling/streaming waits, excluding actual mining and dispatch duration.
+|queue.provider.type |memory |Nondefault framework implementations require independent validation.
+|heartbeat.interval.ms |0 |Disabled at zero; helps persist safe progress on quiet sources but does not force archiving.
+|heartbeat.action.query |Unset |SQL on a separate connection; needs permission and should avoid business-data changes. Standby capture routes it to the primary.
+|errors.max.retries |-1 |Retry budget for retriable errors; -1 unlimited, 0 disables retries.
+|retriable.restart.connector.wait.ms |10000 |Wait before restarting after a retriable failure.
+|event.processing.failure.handling.mode |fail |Framework fail/warn/skip policy; cannot bypass earlier Dameng parse/archive/identity checks.
+|connection.validation.timeout.ms |60000 |Framework connection check budget, not statement/socket timeout.
+|executor.shutdown.timeout.ms |4000 |Executor shutdown wait, not a guarantee of immediate database session release.
+|topic.naming.strategy |SchemaTopicNamingStrategy |Default schema.table naming; test custom implementations.
+|topic.delimiter / topic.cache.size |. / 10000 |Default naming strategy separator/cache.
+|topic.transaction |transaction |Transaction topic suffix.
+|topic.heartbeat.prefix |\_\_debezium-heartbeat |Default heartbeat prefix; topic.heartbeat.name can override the full name.
+|custom.metric.tags |Unset |Comma-separated key=value tags added to JMX names.
+|statistics.metrics.enabled |true |Framework statistics switch.
+|guardrail.collections.max / guardrail.collections.limit.action |0 / warn |Collection-count guardrail; zero means no limit.
+|===
+
+`converters`, `post.processors`, transaction metadata factories, the source-info struct maker, schema/table memory stores and OpenLineage are framework extension points, not certification of third-party implementations.
+OpenLineage is disabled by default and has no module-level external-service acceptance.
+Custom sanitization affects configuration logging keys, not captured business columns.
+JDBC properties come from database.* and driver.* subsets, with driver values taking precedence where permitted.
+Raw URLs, alternate hosts, service files, transparent reconnect and read/write routing cannot bypass connector routing and identity checks.
+Validate SSL/TLS against the actual DM driver; Oracle Wallet instructions do not apply.
+
+=== Schema history and client settings
+
+[cols="3,2,5",options="header"]
+|===
+|Option |Default |Purpose
+|schema.history.internal |KafkaSchemaHistory |Durable recovery history; FileSchemaHistory is used in tests.
+|schema.history.internal.kafka.bootstrap.servers |Required for Kafka history |Independent of the worker's bootstrap setting.
+|schema.history.internal.kafka.topic |Required for Kafka history |Exclusive, single-partition, fully retained history topic.
+|schema.history.internal.kafka.recovery.poll.interval.ms |100 |Recovery poll interval.
+|schema.history.internal.kafka.recovery.attempts |100 |Consecutive empty recovery polls.
+|schema.history.internal.kafka.query.timeout.ms |3000 |Kafka admin query timeout.
+|schema.history.internal.kafka.create.timeout.ms |30000 |History-topic creation timeout; does not fix protocol incompatibility.
+|schema.history.internal.kafka.buffer.batch.size |1024 |History batch-buffer threshold, not business-event batch size.
+|schema.history.internal.skip.unparseable.ddl |false |Lossy DDL policy with the limits documented above.
+|schema.history.internal.store.only.captured.tables.ddl |false |Default broad eligible-table history; true narrows initial schema capture.
+|schema.history.internal.store.only.captured.databases.ddl |false |Additional database/schema filtering; does not enable multi-database capture.
+|===
+
+`schema.history.internal.producer.*` and `.consumer.*` configure history Kafka clients, including SASL/SSL.
+Worker business producer settings use producer.* or allowed producer.override.* connector overrides.
+Signals use their own signal.kafka.topic/bootstrap.servers/groupId/poll.timeout.ms and signal.consumer.* settings; file signals require signal.file.
+Configuring one client does not configure the others.
+
+[id="dameng-recovery"]
+== Recovery and role changes
+
+Keep the connector name, topic.prefix, offsets, complete exclusive history and required archives.
+The source partition is `{"server":"<topic.prefix>"}`; the worker also uses the connector name when finding offsets.
+Normal recovery replays from the confirmed position. `source.lsn` can remain pinned by a long transaction and spill files are not durable recovery state.
+Neither `no_data` nor repeated restart skips missing archives or invalid history.
+
+Before upgrading, preserve the full configuration, supported worker offset-export output and the previous artifact.
+Do not fabricate a missing compatibility_signature. Older native offsets without NUMBER_MODE in their signature require a new capture baseline.
+A rollback must also be able to read the resulting offset/history formats.
+
+`snapshot.mode=recovery` rebuilds schema history from current definitions, retains the saved consumption LSN and transaction-processing position, and does not scan existing rows or request an incremental snapshot.
+It requires an existing offset and available archives. Current definitions must safely interpret all pending logs; incompatible DDL while stopped makes current-schema reconstruction unsafe.
+Stop the connector, back up offsets/history, repair or prepare the exclusive history store, then restart in recovery mode.
+After successful reconstruction, restore the original snapshot mode so subsequent restarts do not rebuild history again.
+A later incremental snapshot can backfill existing rows but cannot reconstruct historical deletes or intermediate changes.
+
+[id="dameng-primary-standby-recovery"]
+=== Primary/standby members without a VIP
+
+List candidate addresses in database.hosts. Members must share physical identity, use N_EP=1 and have a unique writable OPEN PRIMARY.
+The connector fixes JDBC loginStatus=4, rwSeparate=0, autoReconnect=0, switchTimes=1 and switchInterval=200, and rejects conflicting routing overrides.
+Retries select a role-compatible node and resume confirmed progress; unacknowledged events can repeat.
+
+Before a role change, ensure applied redo and continuous archives are available. The DBA performs switchover or fences the old primary before a non-forced takeover.
+Confirm unique PRIMARY/OPEN status and healthy real-time archiving, then observe task recovery and OldestReplayLsn with the same offsets/history.
+Checks include PERMANENT_MAGIC, SYS.SYSOPENHISTORY anchors, source-primary lineage and applied LSN.
+The open-history bound is 128 entries. Lost anchors, ambiguous timestamp ordering, backward applied positions and forked archives fail recovery; a high current LSN is insufficient.
+An old standalone offset without family anchors cannot be upgraded by merely adding standby addresses.
+VIP/proxy/automatic-failover deployments are unverified; DMDSC, multiple writable primaries, distributed log merging, forced lossy takeover and split-brain recovery are unsupported.
+
+[id="dameng-standby-capture"]
+=== Standby capture
+
+Set database.capture.role=standby and include both role candidates in database.hosts. The same account is used on both members.
+The primary connection (loginMode=1) creates/writes signals, commits watermarks, runs heartbeat actions and holds initial snapshot locks.
+The standby connection (loginMode=2) mines logs and reads metadata and snapshot rows.
+User signals must also be written to the primary.
+
+Initial snapshots lock on the primary, choose its LSN, await standby replay and then read the standby, so they still affect primary writers.
+Incremental snapshots commit the low watermark on the primary, wait for standby replay, read the chunk, and then commit the high watermark.
+The mining upper bound is the minimum of the archive bound, V$RAPPLY_SYS.SLSN and V$RAPPLY_PARALLEL_INFO.RPKG_LSN.
+Role and source identity are checked around mining and online metadata reads.
+
+Initial snapshot replay timeout/role changes abort the incomplete snapshot.
+Incremental snapshots retain framework-native error handling: a watermark, replay, role or query failure can log an error, skip the current table and continue streaming without failing the task.
+Once skipped progress is persisted, restart does not automatically rescan it. Unchanged historical rows may be missing; fix the cause and issue a new snapshot request for the table.
+A completed/idle metric alone does not prove completeness.
+
+After a role change, the task reselects both roles. Without an OPEN STANDBY it waits/fails under retry policy and does not fall back to primary capture.
+After a two-node standby promotion, another usable standby is required to resume this capture role.
+
+[id="dameng-monitoring"]
+== Monitoring
+
+MBeans normally use `debezium.dameng:type=connector-metrics,context=<context>,server=<topic.prefix>` plus custom tags.
+Contexts include snapshot, streaming and schema-history. The server tag is the topic prefix, not necessarily the REST connector name.
+Public event/queue metrics describe observed events and queue occupancy, not Kafka acknowledgements.
+Source-time lag is not equivalent to archive backlog or downstream-consumer latency.
+
+Important mining positions are LatestArchivedLsn, ScannedUpperLsn and OldestReplayLsn.
+Their differences are LSN spans, not time or bytes. StandbyReplayableLsn, StandbyReplayedLsn and StandbyMiningUpperLsn describe separate replay/mining bounds.
+CurrentMiningBatchSize/LastWindowLsnSpan describe planned/successful LSN spans; SelectedArchiveFileBytes/Count describe forward selected files, not actual I/O or reconstruction reads.
+MiningWindowByteBudget is the configured soft budget.
+
+ForwardMiningDurationMillis, ReconstructionDurationMillis and DispatchDurationMillis accumulate successful-round stage durations, with corresponding Last* values.
+Forward mining includes session setup/cleanup; dispatch includes conversion and enqueueing but not Kafka acknowledgement.
+Last/MaxMiningDurationMillis includes scan attempts and cleanup before dispatch. MiningSessions/ReconstructionSessions include failed attempts.
+MinedRows/ReconstructedRows include fragments and transaction markers and must not be read as business-row counts.
+OpenTransactions is sampled, not updated synchronously with database commits.
+
+WindowBufferEstimatedBytes/Records and their peak variants describe accumulated raw input estimates; they are not live heap usage or stopping budgets.
+TransactionBufferMemoryBytes/DiskBytes/Records describe retained complete transactions.
+SpilledTransactions counts spill operations in the current task lifetime; reconstruction may spill again.
+BufferLimitFailures counts metadata/single-SQL limit failures, not all disk errors.
+Most counters reset with the task/metric instance or JMX reset; positions are resampled.
+
+=== Snapshot locks
+
+SnapshotLockWaiting, SnapshotLocksHeld, LockedTableCount, SnapshotLockWaitDurationMillis, SnapshotMaxLockWaitDurationMillis and SnapshotLockHoldDurationMillis describe connector observations.
+Hold time starts with the first acquired lock and includes later lock waits, reads, queue waits and rollback. Acquisition time includes the entire JDBC call; do not add these overlapping durations.
+After successful execution and cleanup, LastSnapshotLockStatisticsAvailable and LastSnapshotLockedTableCount/LockWaitDurationMillis/MaxLockWaitDurationMillis/LockHoldDurationMillis retain the result for five minutes or until the next snapshot.
+After expiry, zero values mean unavailable results, not an instantaneous snapshot.
+Failed execution, rollback or timeout leaves release unconfirmed and does not publish a successful result; consult database sessions even if the observed metric still says locks held.
+Incremental snapshots do not use these initial-snapshot lifetime locks.
+
+[id="dameng-incremental-snapshot-monitoring"]
+=== Incremental snapshot metrics
+
+The snapshot context exposes separate IncrementalSnapshot* properties:
+
+[cols="3,6",options="header"]
+|===
+|Property suffix |Meaning
+|Running / Paused |Unfinished work / paused state; neither proves completeness.
+|Phase |idle, preparing, waiting_close, emitting, paused or failed. The exported info-style phase sample changes labels.
+|CurrentTable |Last observed table; fast/empty tables can be missed between scrapes. It is not a per-table cumulative counter.
+|RemainingTableCount |Includes the current table, retains paused state; not remaining rows or an ETA.
+|RowsScanned |Framework-reported completed chunk reads, including re-reads and rows later deduplicated; excludes unreported partial failed reads.
+|RowsEnqueued |Successfully dispatched snapshot rows, excluding streaming DML and Kafka acknowledgements.
+|WindowsCompleted |Windows whose cached rows finished dispatch; the last chunk can be short.
+|CurrentCloseWaitDurationMillis |Elapsed time after CLOSE commit returns until that CLOSE is processed, including pauses if still pending.
+|LastCloseWaitDurationMillis |Last completed close wait, including archiving/replay/mining/dispatch latency.
+|LastEmitDurationMillis |Last completed cached-row dispatch, including conversion/queue waits but excluding Kafka acknowledgements.
+|===
+
+Exporter names use the `dameng_incremental_snapshot_` prefix and convert milliseconds to seconds.
+Counters accumulate over a task lifetime. Two-minute recording-rule rates are rows/second.
+The native framework callbacks do not provide a separate reading phase or last-query duration.
+Internally caught table errors can skip a table without setting failed. Idle, zero remaining tables or Running=false does not establish complete backfill; inspect logs and notification table status.
+For preparing, inspect primary watermark writes, replay barriers and chunk queries; for waiting_close, inspect archives/replay/mining; for emitting, inspect the queue and downstream pressure.
+
+=== Prometheus and Grafana
+
+Resources are in link:../docker/monitoring/[docker/monitoring]. The image includes JMX Exporter 1.4.0 at port 9404.
+Overriding KAFKA_OPTS must retain `-javaagent:/opt/jmx/jmx_prometheus_javaagent-1.4.0.jar=9404:/opt/jmx/jmx-exporter.yaml` to keep monitoring enabled.
+An empty KAFKA_OPTS disables it. JVM startup-argument changes require worker restart/recreation.
+
+[source,yaml]
+----
+scrape_configs:
+  - job_name: dameng-connect
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['dameng-connect:9404']
+rule_files:
+  - /etc/prometheus/dameng/prometheus-rules.yaml
+----
+
+Import dameng-cdc-dashboard.json with a Prometheus datasource or use grafana-provider.yaml. The dashboard UID is dameng-cdc-overview.
+Select matching source prefix and REST connector; JVM metrics belong to the entire worker.
+Kubernetes examples include PodMonitor and PrometheusRule; adapt their namespace/label selectors and deploy shared rules only once per Prometheus.
+Check `/metrics`, target up, loaded rules and rule_evaluation_failures_total before debugging Grafana.
+LSN metrics are gauges, not counters. Missing idle series are not zero. Overlapping queue/dispatch/producer waits must not be added.
+Update the connector, exporter, recording rules and dashboard together. Rule validation from docker/monitoring:
+
+[source,shell]
+----
+docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules \
+  prom/prometheus:v3.5.0 test rules prometheus-rules.test.yaml
+----
+
+[id="dameng-manual-logminer"]
+== Inspecting LogMiner manually
+
+Use a separate CDC-account connection and keep registration/start/query/end in the same physical session.
+Replace the illustrative inclusive LSN range and server-side paths. SCN argument names here refer to Dameng LSNs.
+In disql, terminate PL/SQL blocks with `/`; do not send that slash as SQL through JDBC.
+
+[source,sql]
+----
+SET TIME ZONE '+00:00';
+SELECT MODE$, STATUS$ FROM V$INSTANCE;
+SELECT DB_MAGIC, CUR_LSN FROM V$RLOG;
+SELECT PATH, ARCH_LSN, CLSN, PREV_LSN, DB_MAGIC, PMNT_MAGIC, SRC_DB_MAGIC, DSC_SEQNO
+FROM V$ARCH_FILE
+WHERE PATH IS NOT NULL AND ARCH_LSN <= 101000 AND CLSN >= 100000
+ORDER BY ARCH_LSN;
+
+BEGIN
+  DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME => '/archive/first.log', OPTIONS => DBMS_LOGMNR.ADDFILE);
+  DBMS_LOGMNR.ADD_LOGFILE(LOGFILENAME => '/archive/second.log', OPTIONS => DBMS_LOGMNR.ADDFILE);
+END;
+/
+SELECT LOG_ID, FILENAME, LOW_SCN, NEXT_SCN FROM V$LOGMNR_LOGS ORDER BY LOG_ID;
+BEGIN
+  DBMS_LOGMNR.START_LOGMNR(STARTSCN => 100000, ENDSCN => 101000, OPTIONS => 2048);
+END;
+/
+SELECT SCN, START_SCN, COMMIT_SCN, TIMESTAMP, XID, OPERATION_CODE, ROLL_BACK,
+       SEG_OWNER, TABLE_NAME, USERNAME, SQL_REDO, RS_ID, SSN, CSF,
+       DATA_OBJ#, DATA_OBJV#, RBASQN, RBABLK, RBABYTE
+FROM V$LOGMNR_CONTENTS
+WHERE SCN >= 100000 AND SCN <= 101000
+ORDER BY SCN, RBASQN, RBABLK, RBABYTE, SSN;
+BEGIN
+  DBMS_LOGMNR.END_LOGMNR();
+END;
+/
+----
+
+Register every file covering the range, without duplicate copies. CUR_LSN can exceed the archived tail, and min/max bounds alone do not prove continuity; inspect PREV_LSN links.
+On a standby, query SLSN and RPKG_LSN (DSC_SEQNO=0) and bound the end by their minimum with continuous archives.
+The tested old 8.1.2.128 build fails standby registration with -710; allowing arbitrary standby writes is not a solution.
+
+2048 is NO_ROWID_IN_STMT, matching the connector. Do not add online dictionary 16, delimiter removal 64 or committed-only 2 when reproducing its path.
+OBJ# and COL n are expected without an online dictionary; history resolves them.
+Keep transaction markers and all SQL continuation fragments. Common operation codes are 1 insert, 2 delete, 3 update, 5 DDL, 6 start, 7 commit, 36 rollback and 38 XA commit.
+CSF=1 indicates more SQL fragments; concatenate in SSN order through CSF=0. A client-truncated SQL fragment is not a complete statement.
+ROLL_BACK=1 records are not final CDC outcomes. A window without COMMIT does not prove that a transaction never committed; expand the range to cover its lifecycle.
+Always end LogMiner or close the diagnostic connection after errors. Manual inspection does not change connector offsets/history or replace recovery validation.
+
+[id="dameng-faq"]
+== Troubleshooting
+
+Missing plugin: check extraction layout, plugin.path and the full dependency set on every worker.
+No existing rows: no_data and a completed offset deliberately avoid a new full snapshot.
+Missing included table: inspect startup selection, regular expressions, normalized names, privileges, committed changes and logical logging.
+A stationary source.lsn can be a long transaction; compare scan and replay positions separately.
+New database changes without a new archive bound require inspection of archiving, disk capacity and the current log tail.
+
+Missing archives require restoring the correct continuous source logs or planning a new baseline and reconciliation; restart and no_data do not repair them.
+Unknown historical DDL, invalid identity or missing schema must not be bypassed by resetting consumption progress.
+Online fallback cannot prove that current schema matches old logs. Never fabricate compatibility or family identity anchors.
+For resource failures, distinguish event queue, transaction metadata, SQL payload and spill-disk limits.
+
+Connection I/O, SQLState 08, recoverable connection failures and specific role-availability errors use errors.max.retries.
+Dameng errors -510 (mount), -517 (status changing), -522 (disabled session), -2082 (node status change), -515 (suspend) and -608 (session request timeout) also permit restart/retry, including -608 wrapped in SQLTimeoutException or JDBC exception chains.
+Other 22000 errors are not generically retriable. Both startup and runtime use the retry budget and restart wait.
+Retries cannot bypass identity, archive or configuration checks.
+Whole-snapshot timeouts, other SQL timeouts, invalid history, corrupt spill files, unknown DDL and missing archives require correction.
+
+Save the exact build, sanitized configuration/logs, LSN and failing SQL for diagnosis. SQL, spill files, offsets and history can contain source data.
+Multiple workers improve scheduling availability but do not increase the single connector's task count.
+
+[id="dameng-testing"]
+== Building and testing
+
+Use the standalone Maven wrapper and a build JDK compatible with the pinned parent. See link:../README.md[README] for bootstrap and package commands.
+Run formatting before builds after Java changes. Database tests are opt-in; unit tests do not require a running database.
+Profiles distinguish routine DB tests, diagnostics, performance and packaged Kafka Connect tests; see link:../src/test/README.md[test instructions].
+The full compatibility matrices, SQL corpus applicability and performance properties are in link:../src/test/testing.adoc[testing notes].
+The test instructions also record the standalone 3.6 checkpoint and pinned main verification, including the exact selected cases and runtime versions. Those results do not cover every supported compatibility mode.
+
+Database fixtures use a locally loaded vendor DM image; its archive/import commands and override property are in README.
+A public runner cannot pull the default local-only tag. CI's optional database job requires a prepared Linux x86_64 dameng runner and an explicitly selected available image.
+The packaged worker uses eclipse-temurin:21-jre by default, overridable with dameng.connect.java.image. Embedded-engine verification alone is not worker/broker compatibility evidence.
+
+Run tests serially in one checkout. Surefire and Failsafe reports can remain between invocations; inspect actual class/method counts.
+Run nested class selections separately from method-filtered selections to avoid silently omitting nested suites.
+Use clean verify with dameng-coverage to collect fresh data; its 95% line gate does not replace behavior verification.
+Performance and known-loss diagnostics remain opt-in. Skipped diagnostics are not evidence that a limitation has been fixed.
+For offline testing, prepare the same profiles' Maven/wrapper caches and images, load them on the target, then use Maven -o.
+Record artifact checksums, upstream revision, DB build/settings, driver, topology, exact commands and observed results for each release.

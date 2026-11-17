@@ -1,0 +1,13 @@
+target/
+.superpowers/
+.idea/
+.vscode/
+*.iml
+.classpath
+.project
+.settings/
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+docker/monitoring/agent/
