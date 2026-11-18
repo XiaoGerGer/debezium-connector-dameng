@@ -602,6 +602,7 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         @Test
         void shouldRollBackToAnEarlierSavepointAndContinueAnEmptyTransactionAcrossWindows() throws Exception {
             config = config.edit().with("log.mining.batch.size", 20).with("log.mining.buffer.memory.bytes", 1024)
+                    .with("log.mining.buffer.type", "hybrid")
                     .with("log.mining.window.strategy", "fixed")
                     .with("log.mining.buffer.spill.path", temporaryDirectory.resolve("spill").toString()).build();
             startAndVerifySnapshot();
@@ -645,6 +646,7 @@ class DamengConnectorIT extends AbstractAsyncEngineConnectorTest {
         @ValueSource(booleans = { false, true })
         void shouldDiscardSavepointChangesAlreadyReadInEarlierWindows(boolean restart) throws Exception {
             config = config.edit().with("log.mining.batch.size", 20).with("log.mining.buffer.memory.bytes", 1024)
+                    .with("log.mining.buffer.type", "hybrid")
                     .with("log.mining.window.strategy", "fixed")
                     .with("log.mining.buffer.spill.path", temporaryDirectory.resolve("spill").toString()).build();
             startAndVerifySnapshot();

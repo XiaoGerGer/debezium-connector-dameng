@@ -195,7 +195,7 @@ curl -fsS http://localhost:8083/connector-plugins
 ----
 
 Create the connector with a POST body such as the following. For the file placeholder, configure the worker's FileConfigProvider and mount the corresponding secret file.
-With the default `log.mining.buffer.type=hybrid`, `log.mining.buffer.spill.path` must be writable by the worker account.
+The default `log.mining.buffer.type=memory` does not use temporary files. If you select `hybrid`, `log.mining.buffer.spill.path` must be writable by the worker account.
 
 [source,json]
 ----
@@ -334,8 +334,9 @@ A cross-window commit/rollback can reconstruct transactions from that position, 
 SAVEPOINT outcomes are supported. Spill files do not eliminate the need for old archives.
 
 The transaction cache defaults to 64 MiB of estimated memory, one million retained transaction metadata entries, 1 GiB of per-run spill files and 16 MiB of UTF-16 payload per SQL_REDO statement.
-The default `log.mining.buffer.type=hybrid` spills the largest resident transactions; metadata cannot spill and exhaustion stops processing.
-Set `log.mining.buffer.type=memory` to keep transaction images entirely in memory and avoid temporary files.
+The default `log.mining.buffer.type=memory` keeps transaction images entirely in memory and avoids temporary files.
+Set `log.mining.buffer.type=hybrid` to spill large resident transactions under memory pressure; metadata cannot spill and exhaustion stops processing.
+When upgrading from a version that defaults to hybrid, explicitly set `log.mining.buffer.type=hybrid` to retain automatic spilling. Configurations that omit this setting now use memory mode.
 Memory mode stops before accepting a row or transaction metadata that would exceed `log.mining.buffer.memory.bytes`; it never falls back to disk.
 The incomplete window is not published and its replay position is not advanced. Increase the memory budget, reduce the mining window, or select hybrid storage before restarting.
 Both modes retain transaction-count and SQL-size limits, rollback handling and recovery semantics. Unknown buffer types are rejected.
@@ -564,7 +565,7 @@ Byte budgets are bytes; time units follow each option's name.
 |log.mining.window.strategy |archive_bytes |archive_bytes or fixed.
 |log.mining.window.max.bytes |67108864 |Soft whole-file forward budget for archive_bytes.
 |log.mining.batch.size |1000 |LSN span for fixed mode only.
-|log.mining.buffer.type |hybrid |hybrid spills under memory pressure; memory never spills and stops on memory overflow. Both retain transaction buffering.
+|log.mining.buffer.type |memory |memory never spills and stops on memory overflow; hybrid spills under memory pressure. Both retain transaction buffering.
 |log.mining.buffer.memory.bytes |67108864 |Estimated transaction-memory threshold; hybrid spills, memory stops when exceeded. Not total heap.
 |log.mining.buffer.spill.path |java.io.tmpdir |Parent of private per-run spill directories in hybrid mode; not accessed in memory mode, but must remain nonblank.
 |log.mining.buffer.spill.max.bytes |1073741824 |Per-run currently encoded spill-file limit in hybrid mode; must remain positive in memory mode.

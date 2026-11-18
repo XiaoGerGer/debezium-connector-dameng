@@ -45,6 +45,7 @@ class DamengStandbyIT extends AbstractAsyncEngineConnectorTest {
             final var spill = directory.resolve("spill");
             final var config = configuration(environment, table).with("snapshot.mode", "no_data")
                     .with("log.mining.window.strategy", "fixed").with("log.mining.batch.size", 256)
+                    .with("log.mining.buffer.type", "hybrid")
                     .with("log.mining.buffer.memory.bytes", 1024).with("log.mining.buffer.spill.path", spill.toString()).build();
             try {
                 startEngine(config);

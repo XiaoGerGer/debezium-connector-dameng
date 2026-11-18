@@ -132,10 +132,10 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .withDescription("Maximum simultaneously retained transaction metadata entries, including committed transactions awaiting dispatch. "
                     + "Metadata cannot spill and also counts against log.mining.buffer.memory.bytes. Exceeding either limit stops the task.");
     public static final Field LOG_MINING_BUFFER_TYPE = Field.create("log.mining.buffer.type")
-            .withDisplayName("Transaction buffer storage type").withEnum(LogMiningBufferType.class, LogMiningBufferType.HYBRID)
+            .withDisplayName("Transaction buffer storage type").withEnum(LogMiningBufferType.class, LogMiningBufferType.MEMORY)
             .withWidth(Width.MEDIUM).withImportance(Importance.HIGH)
-            .withDescription("Transaction storage: hybrid (default) spills to temporary files when the memory threshold is exceeded; "
-                    + "memory never spills and stops the task when the estimated memory budget is exceeded. Both modes preserve transaction boundaries and recovery.");
+            .withDescription("Transaction storage: memory (default) never spills and stops the task when the estimated memory budget is exceeded; "
+                    + "hybrid spills to temporary files when the memory threshold is exceeded. Both modes preserve transaction boundaries and recovery.");
     public static final Field LOG_MINING_BUFFER_MEMORY_BYTES = Field.create("log.mining.buffer.memory.bytes")
             .withDisplayName("Transaction cache memory threshold").withType(Type.LONG).withDefault(64L * 1024 * 1024)
             .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)

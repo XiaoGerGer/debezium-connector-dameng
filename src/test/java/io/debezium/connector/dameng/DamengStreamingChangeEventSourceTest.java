@@ -629,7 +629,7 @@ class DamengStreamingChangeEventSourceTest {
         @ParameterizedTest
         @ValueSource(longs = { 0, -1, 999 })
         void shouldRejectUnhandledOperationsWithUnresolvedObjectsAndKeepDiagnosticsAfterSpilling(long objectId) throws Exception {
-            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 512)
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.type", "hybrid").with("log.mining.buffer.memory.bytes", 512)
                     .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
             createSource();
             final var unsupported = new java.util.HashMap<>(dml(101, 90, 120, 1));
@@ -733,6 +733,7 @@ class DamengStreamingChangeEventSourceTest {
         void shouldCacheNewRangesAndReconstructOnlyAtCommit(boolean spill, String strategy) throws Exception {
             config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
                     .with("log.mining.window.strategy", strategy).with("log.mining.window.max.bytes", 64)
+                    .with("log.mining.buffer.type", spill ? "hybrid" : "memory")
                     .with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576).with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
             createSource();
             final var polls = new AtomicInteger();
@@ -1122,10 +1123,9 @@ class DamengStreamingChangeEventSourceTest {
 
         @ParameterizedTest
         @ValueSource(booleans = { false, true })
-        void shouldPublishMemoryOnlyTransactionsWithoutResolvingTheSpillPath(boolean invalidPathSyntax) throws Exception {
+        void shouldPublishMemoryOnlyTransactionsByDefaultWithoutResolvingTheSpillPath(boolean invalidPathSyntax) throws Exception {
             final var unusedPath = java.nio.file.Files.writeString(spillDirectory.resolve("not-a-directory"), "untouched");
-            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.type", "memory")
-                    .with("log.mining.buffer.memory.bytes", 4096)
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 4096)
                     .with("log.mining.buffer.spill.path", unusedPath.toString() + (invalidPathSyntax ? "\u0000" : ""))
                     .with("log.mining.buffer.spill.max.bytes", 1).build());
             createSource();
@@ -1149,7 +1149,7 @@ class DamengStreamingChangeEventSourceTest {
         @ValueSource(strings = { "path", "quota", "corruption" })
         void shouldNotAdvanceTheOffsetWhenTemporaryStorageFails(String mode) throws Exception {
             final var path = mode.equals("path") ? java.nio.file.Files.writeString(spillDirectory.resolve("not-directory"), "keep") : spillDirectory;
-            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", 512)
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.type", "hybrid").with("log.mining.buffer.memory.bytes", 512)
                     .with("log.mining.buffer.spill.path", path.toString())
                     .with("log.mining.buffer.spill.max.bytes", mode.equals("quota") ? 1 : 1048576).build());
             createSource();
@@ -1275,7 +1275,8 @@ class DamengStreamingChangeEventSourceTest {
         @ParameterizedTest
         @MethodSource("sqlParsingFailures")
         void shouldLogTheFullAssembledRowAndStackTraceOnSqlParsingFailure(int operation, String sql, boolean spill) throws Exception {
-            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576)
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.type", spill ? "hybrid" : "memory")
+                    .with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576)
                     .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
             createSource();
             final var prefix = "/*中文😀" + "完整日志".repeat(1500) + "*/\n";

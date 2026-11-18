@@ -431,9 +431,9 @@ services:
       - /srv/dameng-connect-spill:/var/lib/dameng-spill
 ----
 
-使用默认 `log.mining.buffer.type=hybrid` 时，部署前创建并授权落盘目录给镜像运行用户，按全部 Task、遗留目录和其他进程预留磁盘空间；不要使用 tmpfs 代替磁盘。
+默认 `log.mining.buffer.type=memory` 不使用落盘目录，可省略上述落盘 volume。显式选择 `hybrid` 时，部署前创建并授权落盘目录给镜像运行用户，按全部 Task、遗留目录和其他进程预留磁盘空间；不要使用 tmpfs 代替磁盘。
 4 GiB 堆不是容器总内存限制；容器内存还需覆盖 JVM 堆外、JDBC 和运行时开销。现有 Compose 中显式配置的堆参数会覆盖新镜像默认值。
-需在 REST config 中设置 `log.mining.buffer.spill.path=/var/lib/dameng-spill`；只有 volume 不会改变 Connector 的默认临时目录。
+使用 hybrid 时，需在 REST config 中设置 `log.mining.buffer.spill.path=/var/lib/dameng-spill`；只有 volume 不会改变 Connector 的默认临时目录，也不会启用落盘。
 
 [cols="3,4",options="header"]
 |===
@@ -757,8 +757,9 @@ Connector 只读取归档 REDO，未归档尾部会增加延迟。LSN 是日志�
 
 === 内存与临时文件
 
-`log.mining.buffer.type` 选择事务存储模式，默认 `hybrid`，兼容现有内存不足时落盘的行为。
-设置为 `memory` 后，事务内容全部保留在内存，不创建临时目录或文件，也不回退到磁盘。
+`log.mining.buffer.type` 选择事务存储模式，默认 `memory`，事务内容全部保留在内存，不创建临时目录或文件，也不回退到磁盘。
+显式设置为 `hybrid` 后，内存不足时将事务数据写入临时文件。
+从默认 hybrid 的版本升级时，如需保留自动落盘行为，应显式设置 `log.mining.buffer.type=hybrid`；未配置该参数的任务将使用 memory 模式。
 两种模式都保留事务缓冲、提交顺序、回滚重建和恢复语义；未知模式在配置校验时拒绝。
 
 [cols="3,2,5",options="header"]
@@ -1225,7 +1226,7 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`log.mining.batch.size` |`1000` |fixed 模式的前进 LSN 跨度；不是行数，在 archive_bytes 模式下不参与选窗。
 |`log.mining.window.strategy` |`archive_bytes` |archive_bytes 文件字节预算选窗；fixed 固定 LSN。只支持这两种策略。
 |`log.mining.window.max.bytes` |`67108864` |archive_bytes 的完整文件 LEN 软预算，64 MiB；不是内存限制，不截断历史重建，单文件/共享边界可超出。
-|`log.mining.buffer.type` |`hybrid` |hybrid 内存不足时落盘；memory 仅使用内存，超限停止。两者都保留事务缓冲和恢复语义。
+|`log.mining.buffer.type` |`memory` |memory 仅使用内存，超限停止；hybrid 内存不足时落盘。两者都保留事务缓冲和恢复语义。
 |`log.mining.buffer.memory.bytes` |`67108864` |Task 事务缓存估算内存阈值，hybrid 超出时选择事务落盘，memory 超限停止；元数据无法落盘，不是 JVM 总堆上限。
 |`log.mining.buffer.spill.path` |Worker 的 java.io.tmpdir |hybrid 私有临时目录的父目录，建议挂载可写磁盘；memory 不访问该路径，但配置值仍须非空。
 |`log.mining.buffer.spill.max.bytes` |`1073741824` |hybrid 当前编码临时文件总量限制，超限/写入失败停止；memory 不使用该配额，但配置值仍须为正数。

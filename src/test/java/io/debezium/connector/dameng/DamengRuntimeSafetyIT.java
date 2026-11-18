@@ -272,6 +272,7 @@ class DamengRuntimeSafetyIT extends AbstractAsyncEngineConnectorTest {
     @Test
     void shouldDeliverAnEntireTransactionBeyondLegacyBudgetsWithForcedSpilling() throws Exception {
         config = config.edit().with("log.mining.buffer.max.records", 1).with("log.mining.buffer.max.bytes", 1)
+                .with("log.mining.buffer.type", "hybrid")
                 .with("log.mining.buffer.memory.bytes", 1024).with("log.mining.buffer.spill.path", directory.resolve("spill").toString()).build();
         startEngine();
         waitForStreamingRunning("dameng", "dameng");

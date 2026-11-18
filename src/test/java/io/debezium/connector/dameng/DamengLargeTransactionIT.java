@@ -96,6 +96,7 @@ class DamengLargeTransactionIT extends AbstractAsyncEngineConnectorTest {
         config = Configuration.create()
                 .with("log.mining.window.strategy", System.getProperty("dameng.test.window.strategy", "archive_bytes"))
                 .with("topic.prefix", "dameng")
+                .with("log.mining.buffer.type", "hybrid")
                 .with("log.mining.buffer.memory.bytes", 64 * 1024)
                 .with("log.mining.buffer.spill.path", temporaryDirectory.resolve("spill").toString())
                 .with("database.hosts", DamengTestDatabase.hosts())

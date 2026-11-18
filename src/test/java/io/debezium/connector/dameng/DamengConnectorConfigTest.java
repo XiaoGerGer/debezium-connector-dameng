@@ -25,10 +25,10 @@ import io.debezium.relational.TableId;
 
 class DamengConnectorConfigTest {
     @Test
-    void shouldRegisterHybridTransactionBufferingByDefault() {
-        assertThat(new DamengConnectorConfig(configuration().build()).getLogMiningBufferType()).isEqualTo(DamengConnectorConfig.LogMiningBufferType.HYBRID);
+    void shouldRegisterMemoryTransactionBufferingByDefault() {
+        assertThat(new DamengConnectorConfig(configuration().build()).getLogMiningBufferType()).isEqualTo(DamengConnectorConfig.LogMiningBufferType.MEMORY);
         assertThat(DamengConnectorConfig.configDef().configKeys()).containsKey("log.mining.buffer.type");
-        assertThat(DamengConnectorConfig.configDef().configKeys().get("log.mining.buffer.type").defaultValue).isEqualTo("hybrid");
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("log.mining.buffer.type").defaultValue).isEqualTo("memory");
     }
 
     @ParameterizedTest
