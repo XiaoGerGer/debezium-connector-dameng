@@ -222,6 +222,8 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                 scannedThrough = end;
                 firstWindow = false;
                 metrics.setOldestReplayLsn(offset.getLsn());
+                LOGGER.debug("Dameng window completed: start={}, end={}, replayLsn={}, commitLsn={}, reconstructed={}, openTransactions={}",
+                        start, end, offset.getLsn(), offset.getCommitLsn(), reconstructed, buffer.openTransactions());
                 dispatcher.dispatchHeartbeatEvent(partition, offset);
                 metrics.onIterationCompleted(actualSpan, forwardNanos, reconstructionNanos, dispatchNanos);
             }
@@ -243,6 +245,7 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         Throwable failure = null;
         long readRows = 0;
         metrics.onMiningSessionStarted(reconstruction);
+        LOGGER.debug("Dameng mining range: start={}, end={}, reconstruction={}", start, end, reconstruction);
         try {
             connection.startLogMining(start, end, false);
             try (PreparedStatement statement = connection.readTablePreparedStatement(config, connection.logMinerContentsQuery(false), java.util.OptionalLong.empty())) {
