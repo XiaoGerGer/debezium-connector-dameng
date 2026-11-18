@@ -16,6 +16,7 @@ import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.debezium.connector.dameng.DamengConnectorConfig.LogMiningBufferType;
 import io.debezium.connector.dameng.logminer.events.EventType;
 
 /**
@@ -51,6 +52,11 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
 
     public LogMinerTransactionBuffer(long memoryLimit, long maxSqlBytes, long maxTransactions, Path spillPath, long spillLimit,
                                      long baselineLsn) {
+        this(memoryLimit, maxSqlBytes, maxTransactions, spillPath, spillLimit, baselineLsn, LogMiningBufferType.HYBRID);
+    }
+
+    public LogMinerTransactionBuffer(long memoryLimit, long maxSqlBytes, long maxTransactions, Path spillPath, long spillLimit,
+                                     long baselineLsn, LogMiningBufferType bufferType) {
         if (memoryLimit <= 0 || maxSqlBytes <= 0 || maxTransactions <= 0 || spillLimit <= 0) {
             throw new IllegalArgumentException("Dameng transaction buffer limits must be positive");
         }
@@ -58,7 +64,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         this.maxSqlBytes = maxSqlBytes;
         this.maxTransactions = maxTransactions;
         this.baselineLsn = baselineLsn;
-        store = new LogMinerSpillStore(spillPath, spillLimit);
+        store = Objects.requireNonNull(bufferType) == LogMiningBufferType.HYBRID ? new LogMinerSpillStore(spillPath, spillLimit) : null;
     }
 
     public void beginWindow() {
@@ -269,6 +275,13 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     }
 
     private void makeRoom(long bytes) {
+        if (store == null) {
+            if (bytes > memoryLimit - memoryBytes) {
+                throw capacityFailure("Dameng transaction buffer exceeds log.mining.buffer.memory.bytes=" + memoryLimit
+                        + " with log.mining.buffer.type=memory; increase the memory budget, reduce the mining window or use hybrid buffering");
+            }
+            return;
+        }
         while (bytes > memoryLimit - memoryBytes) {
             final var largest = transactions.values().stream().filter(tx -> !tx.rows.isEmpty())
                     .max(Comparator.comparingLong(tx -> tx.memoryBytes)).orElse(null);
@@ -305,7 +318,9 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         if (fragment != null) {
             throw new IllegalStateException("Incomplete Dameng SQL continuation at LSN " + fragment.lsn());
         }
-        store.flush();
+        if (store != null) {
+            store.flush();
+        }
     }
 
     public List<Transaction> committedTransactions() {
@@ -339,7 +354,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     }
 
     public long diskBytes() {
-        return store.bytes();
+        return store == null ? 0 : store.bytes();
     }
 
     public long bufferedRecords() {
@@ -382,7 +397,9 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     @Override
     public void close() {
         try {
-            store.close();
+            if (store != null) {
+                store.close();
+            }
         }
         finally {
             transactions.clear();

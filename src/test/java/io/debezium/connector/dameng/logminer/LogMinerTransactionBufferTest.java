@@ -18,14 +18,66 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import io.debezium.connector.dameng.DamengConnectorConfig.LogMiningBufferType;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.DispatchProgress;
 import io.debezium.connector.dameng.logminer.events.EventType;
 
 class LogMinerTransactionBufferTest {
     @TempDir
     Path directory;
+
+    @Test
+    void shouldRetainAndReleaseExactlyTheMemoryBudgetWithoutCreatingSpillStorage() throws Exception {
+        final var unusedPath = directory.resolve("unused");
+        // XID "a" metadata: 258 bytes; one row with XID "a", SQL "x", RS_ID "r": 510 bytes.
+        try (var buffer = new LogMinerTransactionBuffer(768, 8192, 10, unusedPath, 1, 0, LogMiningBufferType.MEMORY)) {
+            buffer.beginWindow();
+            buffer.add(row("a", 11, 10, 1, 0, "x"));
+            buffer.add(row("a", 12, 10, 7, 0, null));
+            buffer.finishWindow();
+
+            assertThat(buffer.memoryBytes()).isEqualTo(768);
+            assertThat(buffer.diskBytes()).isZero();
+            assertThat(buffer.spilledTransactions()).isZero();
+            assertThat(Files.exists(unusedPath)).isFalse();
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).hasSize(1);
+            assertThat(read(committed.get(0))).containsExactly(row("a", 11, 10, 1, 0, "x"));
+            buffer.release(committed.get(0));
+            assertThat(buffer.completeWindow(20)).isEqualTo(20);
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.bufferedRecords()).isZero();
+        }
+        assertEmptyDirectory();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = { false, true })
+    void shouldPoisonMemoryOnlyBufferOnRowOrMetadataOverflow(boolean metadata) throws Exception {
+        final long memory = metadata ? 257 : 768;
+        try (var buffer = new LogMinerTransactionBuffer(memory, 8192, 10, directory, 1, 0, LogMiningBufferType.MEMORY)) {
+            if (!metadata) {
+                buffer.add(row("a", 11, 10, 1, 0, "x"));
+            }
+            assertThatThrownBy(() -> buffer.add(row("a", 12, 10, metadata ? 6 : 1, 0, metadata ? null : "y")))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("log.mining.buffer.type=memory")
+                    .hasMessageContaining("log.mining.buffer.memory.bytes=" + memory);
+            assertThat(buffer.isCapacityExceeded()).isTrue();
+            assertThat(buffer.memoryBytes()).isLessThanOrEqualTo(memory);
+            assertThat(buffer.bufferedRecords()).isEqualTo(metadata ? 0 : 1);
+            assertThat(buffer.diskBytes()).isZero();
+            assertThat(buffer.spilledTransactions()).isZero();
+            assertThatThrownBy(buffer::committedTransactions).hasMessageContaining("log.mining.buffer.type=memory");
+            assertThatThrownBy(() -> buffer.completeWindow(20)).hasMessageContaining("log.mining.buffer.type=memory");
+            assertThatThrownBy(buffer::resetForReconstruction).hasMessageContaining("log.mining.buffer.type=memory");
+            assertThatThrownBy(() -> buffer.add(row("a", 13, 10, 7, 0, null))).hasMessageContaining("log.mining.buffer.type=memory");
+            assertEmptyDirectory();
+        }
+        assertEmptyDirectory();
+    }
 
     @Test
     void shouldTreatOnlyCommitMarkersAsTransactionCompletion() {
@@ -391,9 +443,10 @@ class LogMinerTransactionBufferTest {
         assertEmptyDirectory();
     }
 
-    @Test
-    void shouldReplaceSpilledProvisionalImagesWithTheFinalRollbackView() {
-        try (var buffer = buffer(512)) {
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldReplaceProvisionalImagesWithTheFinalRollbackView(LogMiningBufferType type) throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(type == LogMiningBufferType.MEMORY ? 4096 : 512, 8192, 10, directory, 1048576, 0, type)) {
             buffer.add(row("a", 11, 10, 1, 0, "keep"));
             buffer.add(row("a", 12, 10, 36, 0, null));
             buffer.add(row("a", 13, 10, 1, 0, "discard"));
@@ -414,7 +467,9 @@ class LogMinerTransactionBufferTest {
             buffer.add(row("a", 21, 10, 36, 0, null));
             buffer.add(row("a", 25, 10, 7, 0, null));
             assertThat(read(buffer.committedTransactions().get(0))).extracting(LogMinerRow::redo).containsExactly("keep");
+            assertThat(buffer.spilledTransactions()).isEqualTo(type == LogMiningBufferType.MEMORY ? 0 : 2);
         }
+        assertEmptyDirectory();
     }
 
     @Test

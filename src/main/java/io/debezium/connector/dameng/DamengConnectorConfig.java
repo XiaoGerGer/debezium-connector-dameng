@@ -131,21 +131,28 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
             .withDescription("Maximum simultaneously retained transaction metadata entries, including committed transactions awaiting dispatch. "
                     + "Metadata cannot spill and also counts against log.mining.buffer.memory.bytes. Exceeding either limit stops the task.");
+    public static final Field LOG_MINING_BUFFER_TYPE = Field.create("log.mining.buffer.type")
+            .withDisplayName("Transaction buffer storage type").withEnum(LogMiningBufferType.class, LogMiningBufferType.HYBRID)
+            .withWidth(Width.MEDIUM).withImportance(Importance.HIGH)
+            .withDescription("Transaction storage: hybrid (default) spills to temporary files when the memory threshold is exceeded; "
+                    + "memory never spills and stops the task when the estimated memory budget is exceeded. Both modes preserve transaction boundaries and recovery.");
     public static final Field LOG_MINING_BUFFER_MEMORY_BYTES = Field.create("log.mining.buffer.memory.bytes")
             .withDisplayName("Transaction cache memory threshold").withType(Type.LONG).withDefault(64L * 1024 * 1024)
             .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
-            .withDescription("Task-wide estimated transaction cache memory threshold. Spill transactions to local temporary files when exceeded. "
+            .withDescription("Task-wide estimated transaction cache memory threshold. Hybrid mode spills transactions when exceeded; memory mode stops the task. "
                     + "Includes retained transaction metadata; excludes JDBC, SQL continuation assembly and event queues. This is not a JVM heap limit.");
     public static final Field LOG_MINING_BUFFER_SPILL_PATH = Field.create("log.mining.buffer.spill.path")
             .withDisplayName("Transaction spill directory").withType(Type.STRING).withDefault(System.getProperty("java.io.tmpdir"))
             .withWidth(Width.LONG).withImportance(Importance.HIGH).withValidation(Field::isRequired)
             .withDescription("Writable parent directory for task-owned temporary transaction files. Use a disk-backed Docker mount. "
-                    + "Files are disposable, are not a recovery source, and do not replace archive retention. Each run creates its own directory.");
+                    + "Files are disposable, are not a recovery source, and do not replace archive retention. Each run creates its own directory when spilling. "
+                    + "Memory mode does not access this path, but the value must still be nonblank.");
     public static final Field LOG_MINING_BUFFER_SPILL_MAX_BYTES = Field.create("log.mining.buffer.spill.max.bytes")
             .withDisplayName("Transaction spill disk limit").withType(Type.LONG).withDefault(1024L * 1024 * 1024)
             .withWidth(Width.MEDIUM).withImportance(Importance.HIGH).withValidation(Field::isPositiveLong)
             .withDescription("Maximum total temporary transaction file bytes for one task run. Exceeding the limit or any local I/O failure "
-                    + "stops the task without skipping history. Allow additional filesystem free space and retain archives for restart.");
+                    + "stops the task without skipping history. Allow additional filesystem free space and retain archives for restart. "
+                    + "Applies only to hybrid mode; the value must remain positive in memory mode.");
 
     public static final Field PARTITION_DROP_IGNORE = Field.create("partition.drop.ignore")
             .withDisplayName("Ignore partition drops and truncates").withType(Type.BOOLEAN).withDefault(false)
@@ -185,7 +192,8 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             .group(Field.Group.CONNECTOR, CONNECTOR_ADAPTER, LOG_MINING_BATCH_SIZE,
                     LOG_MINING_WINDOW_STRATEGY, LOG_MINING_WINDOW_MAX_BYTES,
                     LOG_MINING_BUFFER_MAX_BYTES,
-                    LOG_MINING_BUFFER_MAX_RECORDS, LOG_MINING_BUFFER_MAX_SQL_BYTES, LOG_MINING_BUFFER_MAX_TRANSACTIONS, LOG_MINING_BUFFER_MEMORY_BYTES,
+                    LOG_MINING_BUFFER_MAX_RECORDS, LOG_MINING_BUFFER_MAX_SQL_BYTES, LOG_MINING_BUFFER_MAX_TRANSACTIONS, LOG_MINING_BUFFER_TYPE,
+                    LOG_MINING_BUFFER_MEMORY_BYTES,
                     LOG_MINING_BUFFER_SPILL_PATH, LOG_MINING_BUFFER_SPILL_MAX_BYTES,
                     QUERY_FETCH_SIZE, UNAVAILABLE_VALUE_PLACEHOLDER, PARTITION_DROP_IGNORE, PARTITION_EXCHANGE_IGNORE, CASCADE_DROP_IGNORE)
             .group(Field.Group.CONNECTOR, SOURCE_INFO_STRUCT_MAKER)
@@ -266,6 +274,7 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
             throw new IllegalArgumentException("Dameng mining window byte budget must be positive");
         }
         getMiningWindowStrategy();
+        getLogMiningBufferType();
         validateRemovedMiningWindowSettings(config, LOG_MINING_WINDOW_STRATEGY, (field, value, problem) -> {
             throw new IllegalArgumentException(problem);
         });
@@ -368,6 +377,10 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
 
     public long getLogMiningBufferMaxTransactions() {
         return getConfig().getLong(LOG_MINING_BUFFER_MAX_TRANSACTIONS);
+    }
+
+    public LogMiningBufferType getLogMiningBufferType() {
+        return LogMiningBufferType.parse(getConfig().getString(LOG_MINING_BUFFER_TYPE));
     }
 
     public long getLogMiningBufferMemoryBytes() {
@@ -612,6 +625,31 @@ public final class DamengConnectorConfig extends HistorizedRelationalDatabaseCon
                 }
             }
             throw new IllegalArgumentException("Unknown Dameng database.capture.role: " + value + ". Use primary or standby.");
+        }
+    }
+
+    public enum LogMiningBufferType implements EnumeratedValue {
+        HYBRID("hybrid"),
+        MEMORY("memory");
+
+        private final String value;
+
+        LogMiningBufferType(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        static LogMiningBufferType parse(String value) {
+            for (var type : values()) {
+                if (type.value.equalsIgnoreCase(value)) {
+                    return type;
+                }
+            }
+            throw new IllegalArgumentException("Unknown Dameng log.mining.buffer.type: " + value + ". Use hybrid or memory.");
         }
     }
 

@@ -194,7 +194,7 @@ curl -fsS http://localhost:8083/connector-plugins
 ----
 
 Create the connector with a POST body such as the following. For the file placeholder, configure the worker's FileConfigProvider and mount the corresponding secret file.
-`log.mining.buffer.spill.path` must be writable by the worker account.
+With the default `log.mining.buffer.type=hybrid`, `log.mining.buffer.spill.path` must be writable by the worker account.
 
 [source,json]
 ----
@@ -333,11 +333,19 @@ A cross-window commit/rollback can reconstruct transactions from that position, 
 SAVEPOINT outcomes are supported. Spill files do not eliminate the need for old archives.
 
 The transaction cache defaults to 64 MiB of estimated memory, one million retained transaction metadata entries, 1 GiB of per-run spill files and 16 MiB of UTF-16 payload per SQL_REDO statement.
-It spills the largest resident transactions; metadata cannot spill and exhaustion stops processing.
+The default `log.mining.buffer.type=hybrid` spills the largest resident transactions; metadata cannot spill and exhaustion stops processing.
+Set `log.mining.buffer.type=memory` to keep transaction images entirely in memory and avoid temporary files.
+Memory mode stops before accepting a row or transaction metadata that would exceed `log.mining.buffer.memory.bytes`; it never falls back to disk.
+The incomplete window is not published and its replay position is not advanced. Increase the memory budget, reduce the mining window, or select hybrid storage before restarting.
+Both modes retain transaction-count and SQL-size limits, rollback handling and recovery semantics. Unknown buffer types are rejected.
 The SQL limit covers all continuous fragments and is checked before concatenation. JDBC and temporary copies require additional memory.
 These budgets do not include the event queue or the whole JVM heap.
 
-Each run creates a private `dameng-tx-*` directory under `log.mining.buffer.spill.path`. Files contain source data and do not provide restart recovery.
+Hybrid mode creates a private `dameng-tx-*` directory under `log.mining.buffer.spill.path` when it first spills. Files contain source data and do not provide restart recovery.
+Memory mode does not resolve or access the spill path, and spill-byte and spill-count metrics remain zero. Spill configuration still requires a nonblank path and a positive byte limit.
+Switching buffer types uses a normal connector configuration update and task restart; retain offsets, schema history and the required archives.
+Memory mode still defaults to a 64 MiB estimated transaction budget. Size it together with the JVM heap and leave room for JDBC and event queues; archive bytes do not predict heap usage.
+Large archive windows, including single 2 GiB files, can exhaust this budget even when every transaction is small and already committed.
 After a forced termination, remove only directories known to belong to terminated runs. Disk quotas exclude other tasks and abandoned files.
 I/O and checksum errors stop capture rather than dropping transactions.
 Deprecated `log.mining.buffer.max.bytes` and `log.mining.buffer.max.records` are ignored with a warning.
@@ -555,9 +563,10 @@ Byte budgets are bytes; time units follow each option's name.
 |log.mining.window.strategy |archive_bytes |archive_bytes or fixed.
 |log.mining.window.max.bytes |67108864 |Soft whole-file forward budget for archive_bytes.
 |log.mining.batch.size |1000 |LSN span for fixed mode only.
-|log.mining.buffer.memory.bytes |67108864 |Estimated transaction-memory threshold; not total heap.
-|log.mining.buffer.spill.path |java.io.tmpdir |Parent of private per-run spill directories.
-|log.mining.buffer.spill.max.bytes |1073741824 |Per-run currently encoded spill-file limit.
+|log.mining.buffer.type |hybrid |hybrid spills under memory pressure; memory never spills and stops on memory overflow. Both retain transaction buffering.
+|log.mining.buffer.memory.bytes |67108864 |Estimated transaction-memory threshold; hybrid spills, memory stops when exceeded. Not total heap.
+|log.mining.buffer.spill.path |java.io.tmpdir |Parent of private per-run spill directories in hybrid mode; not accessed in memory mode, but must remain nonblank.
+|log.mining.buffer.spill.max.bytes |1073741824 |Per-run currently encoded spill-file limit in hybrid mode; must remain positive in memory mode.
 |log.mining.buffer.max.transactions |1000000 |Retained transaction metadata, including committed transactions awaiting dispatch.
 |log.mining.buffer.max.sql.bytes |16777216 |UTF-16 payload cap per complete SQL_REDO, two bytes per Java character.
 |partition.drop.ignore / partition.exchange.ignore / cascade.drop.ignore |false |Dedicated lossy DDL policies described above.

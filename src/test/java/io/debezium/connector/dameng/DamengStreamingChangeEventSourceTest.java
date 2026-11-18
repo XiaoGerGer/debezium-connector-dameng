@@ -1097,6 +1097,55 @@ class DamengStreamingChangeEventSourceTest {
     @Nested
     class CapacityAndStorage {
         @ParameterizedTest
+        @ValueSource(longs = { 512, 1200 })
+        void shouldFailMemoryOnlyOverflowWithoutPublishingOrAdvancingOffsets(long memory) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.type", "memory")
+                    .with("log.mining.buffer.memory.bytes", memory).with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
+            createSource();
+            records(List.of(dml(101, 90, 110, 1), commit(110, 90, 1), dml(120, 115, 140, 2), commit(140, 115, 2)));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessageContaining("log.mining.buffer.type=memory")
+                    .hasMessageContaining("log.mining.buffer.memory.bytes=" + memory);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(90);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+            assertThat(metrics.getBufferLimitFailures()).isEqualTo(1);
+            assertThat(metrics.getSpilledTransactions()).isZero();
+            assertThat(metrics.getTransactionBufferDiskBytes()).isZero();
+            try (var files = java.nio.file.Files.list(spillDirectory)) {
+                assertThat(files.toList()).isEmpty();
+            }
+        }
+
+        @ParameterizedTest
+        @ValueSource(booleans = { false, true })
+        void shouldPublishMemoryOnlyTransactionsWithoutResolvingTheSpillPath(boolean invalidPathSyntax) throws Exception {
+            final var unusedPath = java.nio.file.Files.writeString(spillDirectory.resolve("not-a-directory"), "untouched");
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.buffer.type", "memory")
+                    .with("log.mining.buffer.memory.bytes", 4096)
+                    .with("log.mining.buffer.spill.path", unusedPath.toString() + (invalidPathSyntax ? "\u0000" : ""))
+                    .with("log.mining.buffer.spill.max.bytes", 1).build());
+            createSource();
+            records(List.of(dml(101, 90, 120, 1), commit(120, 90, 1)));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(delivered).hasSize(1);
+            assertThat(offset.getLsn()).isEqualTo(150);
+            assertThat(metrics.getSpilledTransactions()).isZero();
+            assertThat(metrics.getTransactionBufferDiskBytes()).isZero();
+            assertThat(java.nio.file.Files.readString(unusedPath)).isEqualTo("untouched");
+            try (var files = java.nio.file.Files.list(spillDirectory)) {
+                assertThat(files.toList()).containsExactly(unusedPath);
+            }
+        }
+
+        @ParameterizedTest
         @ValueSource(strings = { "path", "quota", "corruption" })
         void shouldNotAdvanceTheOffsetWhenTemporaryStorageFails(String mode) throws Exception {
             final var path = mode.equals("path") ? java.nio.file.Files.writeString(spillDirectory.resolve("not-directory"), "keep") : spillDirectory;

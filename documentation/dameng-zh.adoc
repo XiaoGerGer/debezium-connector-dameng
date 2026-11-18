@@ -415,7 +415,7 @@ services:
       - /srv/dameng-connect-spill:/var/lib/dameng-spill
 ----
 
-部署前创建并授权落盘目录给镜像运行用户，按全部 Task、遗留目录和其他进程预留磁盘空间；不要使用 tmpfs 代替磁盘。
+使用默认 `log.mining.buffer.type=hybrid` 时，部署前创建并授权落盘目录给镜像运行用户，按全部 Task、遗留目录和其他进程预留磁盘空间；不要使用 tmpfs 代替磁盘。
 4 GiB 堆不是容器总内存限制；容器内存还需覆盖 JVM 堆外、JDBC 和运行时开销。现有 Compose 中显式配置的堆参数会覆盖新镜像默认值。
 需在 REST config 中设置 `log.mining.buffer.spill.path=/var/lib/dameng-spill`；只有 volume 不会改变 Connector 的默认临时目录。
 
@@ -738,17 +738,26 @@ Connector 只读取归档 REDO，未归档尾部会增加延迟。LSN 是日志�
 
 === 内存与临时文件
 
+`log.mining.buffer.type` 选择事务存储模式，默认 `hybrid`，兼容现有内存不足时落盘的行为。
+设置为 `memory` 后，事务内容全部保留在内存，不创建临时目录或文件，也不回退到磁盘。
+两种模式都保留事务缓冲、提交顺序、回滚重建和恢复语义；未知模式在配置校验时拒绝。
+
 [cols="3,2,5",options="header"]
 |===
 |预算 |默认值 |超限处理
-|事务缓存估算内存 |64 MiB |将最大驻留事务写入临时文件；事务元数据不能落盘，耗尽时停止。
+|事务缓存估算内存 |64 MiB |hybrid 将最大驻留事务写入临时文件；memory 在超限前停止。事务元数据不能落盘，耗尽时停止。
 |保留事务元数据条数 |1000000 |包含已提交待分发事务，超限停止。
-|单次运行的临时文件 |1 GiB |超限、I/O 失败或文件校验失败时停止。
+|单次运行的临时文件 |1 GiB |仅 hybrid 使用；超限、I/O 失败或文件校验失败时停止。
 |单条 SQL_REDO |16 MiB UTF-16 payload |包含所有连续片段，拼接前检查；不能边拼接边落盘。
 |===
 
 事务内存预算不包括事件队列、JDBC、SQL 拼接和转换开销，不能作为 JVM 堆上限。
-`log.mining.buffer.spill.path` 应指向可写磁盘，运行中创建私有 `dameng-tx-*` 目录。临时文件含源数据；强制终止后，只清理已确认结束的运行目录。
+memory 模式仍使用默认 64 MiB 预算；应结合堆大小设置 `log.mining.buffer.memory.bytes` 并给其他组件留出空间，不能按归档大小直接估算堆占用。
+单个 2 GiB 归档形成的大窗口，即使包含的都是已提交小事务，也可能耗尽纯内存预算。
+超限时本窗口不发布、安全重放位置不推进；应增大预算、缩小挖掘窗口或改为 hybrid 后重启，单纯反复重启不能解决同一窗口超限。
+hybrid 模式下 `log.mining.buffer.spill.path` 应指向可写磁盘，首次落盘时创建私有 `dameng-tx-*` 目录。临时文件含源数据；强制终止后，只清理已确认结束的运行目录。
+memory 模式不解析或访问落盘路径，落盘字节和次数指标保持 0；配置值仍要求路径非空、落盘配额为正数。
+切换模式通过正常配置更新及 Task 重启生效，保留原 offset、schema history 和所需归档。
 
 临时文件不用于重启恢复。新 Task 从 offset 重放归档，不能因缓存已落盘就删除旧归档。
 磁盘配额不包含其他 Task 或遗留文件，须另外监控剩余空间。
@@ -1197,9 +1206,10 @@ Connector 参数、Worker 参数和数据库参数是三层不同配置，例如
 |`log.mining.batch.size` |`1000` |fixed 模式的前进 LSN 跨度；不是行数，在 archive_bytes 模式下不参与选窗。
 |`log.mining.window.strategy` |`archive_bytes` |archive_bytes 文件字节预算选窗；fixed 固定 LSN。只支持这两种策略。
 |`log.mining.window.max.bytes` |`67108864` |archive_bytes 的完整文件 LEN 软预算，64 MiB；不是内存限制，不截断历史重建，单文件/共享边界可超出。
-|`log.mining.buffer.memory.bytes` |`67108864` |Task 事务缓存估算内存阈值，超出时选择事务落盘；元数据无法落盘，不是 JVM 总堆上限。
-|`log.mining.buffer.spill.path` |Worker 的 java.io.tmpdir |每次运行创建私有临时目录的父目录；建议挂载可写磁盘，tmpfs 仍消耗内存。
-|`log.mining.buffer.spill.max.bytes` |`1073741824` |单次 Task 运行当前编码临时文件总量限制；超限/写入失败停止，不跳数据。
+|`log.mining.buffer.type` |`hybrid` |hybrid 内存不足时落盘；memory 仅使用内存，超限停止。两者都保留事务缓冲和恢复语义。
+|`log.mining.buffer.memory.bytes` |`67108864` |Task 事务缓存估算内存阈值，hybrid 超出时选择事务落盘，memory 超限停止；元数据无法落盘，不是 JVM 总堆上限。
+|`log.mining.buffer.spill.path` |Worker 的 java.io.tmpdir |hybrid 私有临时目录的父目录，建议挂载可写磁盘；memory 不访问该路径，但配置值仍须非空。
+|`log.mining.buffer.spill.max.bytes` |`1073741824` |hybrid 当前编码临时文件总量限制，超限/写入失败停止；memory 不使用该配额，但配置值仍须为正数。
 |`log.mining.buffer.max.transactions` |`1000000` |同时保留的事务元数据条数，包含提交后待发送事务；超限停止，元数据同时计入内存阈值。
 |`log.mining.buffer.max.sql.bytes` |`16777216` |单条 SQL_REDO 连续片段的 UTF-16 payload 上限，每个 Java 字符计 2 字节；拼接前检查，JDBC 和临时副本还需额外堆。
 |`log.mining.buffer.max.bytes` |无 |已废弃，设置会 WARN 并忽略。不是事务内存阈值。

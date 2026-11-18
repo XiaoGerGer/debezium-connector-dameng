@@ -105,8 +105,10 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
         objectTables.clear();
         objectTablesVersion = Long.MIN_VALUE;
         try (var buffer = new LogMinerTransactionBuffer(config.getLogMiningBufferMemoryBytes(), config.getLogMiningBufferMaxSqlBytes(),
-                config.getLogMiningBufferMaxTransactions(), Path.of(config.getLogMiningBufferSpillPath()), config.getLogMiningBufferSpillMaxBytes(),
-                offset.getTransactionBaselineLsn())) {
+                config.getLogMiningBufferMaxTransactions(),
+                config.getLogMiningBufferType() == DamengConnectorConfig.LogMiningBufferType.HYBRID ? Path.of(config.getLogMiningBufferSpillPath()) : null,
+                config.getLogMiningBufferSpillMaxBytes(), offset.getTransactionBaselineLsn(), config.getLogMiningBufferType())) {
+            LOGGER.info("Dameng transaction buffer type={}, memoryLimit={} bytes", config.getLogMiningBufferType().getValue(), config.getLogMiningBufferMemoryBytes());
             connection.validateLogMiningConfiguration();
             connection.validateCompatibilityEnvironment(offset);
             ddlParser = connection.createDdlParser();

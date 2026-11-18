@@ -10,6 +10,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mockConstruction;
 
+import java.util.List;
+
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -22,6 +24,41 @@ import io.debezium.junit.logging.LogInterceptor;
 import io.debezium.relational.TableId;
 
 class DamengConnectorConfigTest {
+    @Test
+    void shouldRegisterHybridTransactionBufferingByDefault() {
+        assertThat(new DamengConnectorConfig(configuration().build()).getLogMiningBufferType()).isEqualTo(DamengConnectorConfig.LogMiningBufferType.HYBRID);
+        assertThat(DamengConnectorConfig.configDef().configKeys()).containsKey("log.mining.buffer.type");
+        assertThat(DamengConnectorConfig.configDef().configKeys().get("log.mining.buffer.type").defaultValue).isEqualTo("hybrid");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "none", "disabled", "disk", "unknown", "" })
+    void shouldRejectUnknownTransactionBufferTypes(String type) {
+        final var raw = configuration().with("log.mining.buffer.type", type).build();
+        assertThatThrownBy(() -> new DamengConnectorConfig(raw)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("log.mining.buffer.type");
+        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("log.mining.buffer.type").errorMessages()).isNotEmpty();
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "hybrid,HYBRID", "memory,MEMORY", "HYBRID,HYBRID", "MEMORY,MEMORY" })
+    void shouldAcceptSupportedTransactionBufferTypes(String type, String expected) {
+        final var raw = configuration().with("log.mining.buffer.type", type).build();
+        assertThat(new DamengConnectorConfig(raw).getLogMiningBufferType().name()).isEqualTo(expected);
+        assertThat(raw.validate(DamengConnectorConfig.ALL_FIELDS).get("log.mining.buffer.type").errorMessages()).isEmpty();
+    }
+
+    @Test
+    void shouldValidateResourceSettingsEvenInMemoryOnlyMode() {
+        final var raw = configuration().with("log.mining.buffer.type", "memory");
+        for (var field : List.of("log.mining.buffer.memory.bytes", "log.mining.buffer.max.transactions", "log.mining.buffer.max.sql.bytes",
+                "log.mining.buffer.spill.max.bytes")) {
+            assertThatThrownBy(() -> new DamengConnectorConfig(raw.build().edit().with(field, 0).build())).isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThatThrownBy(() -> new DamengConnectorConfig(raw.with("log.mining.buffer.spill.path", " ").build()))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     @Test
     void shouldRequireAnExplicitPartitionExchangeOptIn() {
         assertThat(new DamengConnectorConfig(configuration().build()).isPartitionExchangeIgnored()).isFalse();
