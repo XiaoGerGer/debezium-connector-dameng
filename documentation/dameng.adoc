@@ -329,8 +329,9 @@ File sizes include preallocation and previously scanned portions. One file, shar
 The connector processes the available tail without waiting to fill a budget. Missing/nonpositive file lengths, gaps, mixed sources and invalid overlaps stop capture.
 The alternative `fixed` strategy advances by `log.mining.batch.size` LSN units.
 
-Unfinished transactions remain across windows and pin the oldest safe replay position.
-A cross-window commit/rollback can reconstruct transactions from that position, excluding rolled-back operations before publication in commit order.
+Unfinished transactions pin the oldest safe replay position.
+Whenever safe archive progress advances and transactions remain from the previous window, the connector proactively rereads from that position through the new upper bound, replacing the provisional cache before reading and excluding rolled-back operations before publication in commit order.
+The upper bound is selected from forward scan progress independently of the reread position. The new-archive budget does not truncate historical reads; without new progress the connector waits. Long transactions increase repeated mining work.
 SAVEPOINT outcomes are supported. Spill files do not eliminate the need for old archives.
 
 The transaction cache defaults to 64 MiB of estimated memory, one million retained transaction metadata entries, 1 GiB of per-run spill files and 16 MiB of UTF-16 payload per SQL_REDO statement.
@@ -725,6 +726,7 @@ CurrentMiningBatchSize/LastWindowLsnSpan describe planned/successful LSN spans; 
 MiningWindowByteBudget is the configured soft budget.
 
 ForwardMiningDurationMillis, ReconstructionDurationMillis and DispatchDurationMillis accumulate successful-round stage durations, with corresponding Last* values.
+An active reread counts its entire scan toward reconstruction time, with zero forward mining time for that round; a round without reconstruction has zero reconstruction time.
 Forward mining includes session setup/cleanup; dispatch includes conversion and enqueueing but not Kafka acknowledgement.
 Last/MaxMiningDurationMillis includes scan attempts and cleanup before dispatch. MiningSessions/ReconstructionSessions include failed attempts.
 MinedRows/ReconstructedRows include fragments and transaction markers and must not be read as business-row counts.

@@ -223,9 +223,6 @@ class DamengStreamingChangeEventSourceTest {
                 // Its START and earlier writes preceded the schema baseline.
                 records(List.of(dml(115, 50, 0, 1)));
             }
-            else if (start == 121) {
-                records(List.of(commit(125, 0, 1), commit(126, 0, 2)));
-            }
             else if (start == 100) {
                 records(List.of(dml(115, 50, 125, 1), commit(125, 50, 1), commit(126, 0, 2)));
             }
@@ -240,7 +237,7 @@ class DamengStreamingChangeEventSourceTest {
         }
         source.execute(context, new DamengPartition("dm"), offset);
         assertThat(failure.get()).isNull();
-        assertThat(starts).contains(restarted ? new Long[]{ 110L, 121L, 100L } : new Long[]{ 100L, 111L, 121L, 100L });
+        assertThat(starts).containsExactly(restarted ? new Long[]{ 110L, 100L } : new Long[]{ 100L, 111L, 100L });
         assertThat(delivered).singleElement().satisfies(value -> assertThat(value).containsEntry("change_lsn", 115L));
         assertThat(offset.getLsn()).isEqualTo(130);
         assertThat(offset.getOffset().get("snapshot_baseline_lsn")).isEqualTo(100L);
@@ -730,9 +727,9 @@ class DamengStreamingChangeEventSourceTest {
 
         @ParameterizedTest
         @org.junit.jupiter.params.provider.CsvSource({ "false,fixed", "true,fixed", "false,archive_bytes", "true,archive_bytes" })
-        void shouldCacheNewRangesAndReconstructOnlyAtCommit(boolean spill, String strategy) throws Exception {
+        void shouldRereadRetainedTransactionsWhileAdvancingPastOversizedArchives(boolean spill, String strategy) throws Exception {
             config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
-                    .with("log.mining.window.strategy", strategy).with("log.mining.window.max.bytes", 64)
+                    .with("log.mining.window.strategy", strategy).with("log.mining.window.max.bytes", 64L * 1024 * 1024)
                     .with("log.mining.buffer.type", spill ? "hybrid" : "memory")
                     .with("log.mining.buffer.memory.bytes", spill ? 512 : 1048576).with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
             createSource();
@@ -745,9 +742,9 @@ class DamengStreamingChangeEventSourceTest {
             });
             doAnswer(invocation -> {
                 connection.latestArchivedLsn();
-                return List.of(new DamengConnection.ArchiveLogFile("first", 90, 100, 42, 89, 0, 0, 0, 64),
-                        new DamengConnection.ArchiveLogFile("second", 101, 110, 42, 100, 0, 0, 0, 64),
-                        new DamengConnection.ArchiveLogFile("third", 111, 120, 42, 110, 0, 0, 0, 64));
+                return List.of(new DamengConnection.ArchiveLogFile("first", 90, 100, 42, 89, 0, 0, 0, 2L * 1024 * 1024 * 1024),
+                        new DamengConnection.ArchiveLogFile("second", 101, 110, 42, 100, 0, 0, 0, 2L * 1024 * 1024 * 1024),
+                        new DamengConnection.ArchiveLogFile("third", 111, 120, 42, 110, 0, 0, 0, 2L * 1024 * 1024 * 1024));
             }).when(connection).readArchiveLogFiles();
             final List<Long> starts = new ArrayList<>();
             doAnswer(invocation -> {
@@ -758,13 +755,12 @@ class DamengStreamingChangeEventSourceTest {
                     records(List.of(dml(95, 92, 0, 1)));
                 }
                 else if (end == 110) {
-                    records(List.of(dml(105, 0, 0, 1)));
+                    records(List.of(dml(95, 92, 0, 1), dml(105, 92, 0, 1)).stream()
+                            .filter(row -> (long) row.get("SCN") >= start).toList());
                 }
-                else if (start == 111) {
-                    records(List.of(commit(115, 0, 1)));
-                }
-                else if (start == 92) {
-                    records(List.of(dml(95, 92, 115, 1), dml(105, 92, 115, 1), commit(115, 92, 1)));
+                else if (end == 120) {
+                    records(List.of(dml(95, 92, 115, 1), dml(105, 92, 115, 1), commit(115, 92, 1)).stream()
+                            .filter(row -> (long) row.get("SCN") >= start).toList());
                 }
                 else {
                     throw new AssertionError("Unexpected historical re-read " + start);
@@ -776,42 +772,64 @@ class DamengStreamingChangeEventSourceTest {
             source.execute(context, new DamengPartition("dm"), offset);
 
             assertThat(failure.get()).isNull();
-            assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
+            assertThat(starts).containsExactly(90L, 92L, 92L);
             assertThat(delivered).extracting(value -> value.get("change_lsn"))
                     .containsExactly(95L, 105L);
             assertThat(delivered).allSatisfy(value -> assertThat(value).containsEntry("lsn", 92L));
             assertThat(offset.getLsn()).isEqualTo(120);
-            assertThat(metrics.getMiningSessions()).isEqualTo(4);
-            assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
+            assertThat(metrics.getMiningSessions()).isEqualTo(3);
+            assertThat(metrics.getReconstructionSessions()).isEqualTo(2);
             assertThat(metrics.getMinedRows()).isEqualTo(6);
-            assertThat(metrics.getReconstructedRows()).isEqualTo(3);
-            assertThat(metrics.getSpilledTransactions()).isEqualTo(spill ? 2 : 0);
+            assertThat(metrics.getReconstructedRows()).isEqualTo(5);
+            assertThat(metrics.getSpilledTransactions()).isEqualTo(spill ? 3 : 0);
+            assertThat(metrics.getLastWindowLsnSpan()).isEqualTo(10);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(120);
+            if (strategy.equals("archive_bytes")) {
+                assertThat(metrics.getSelectedArchiveFileCount()).isEqualTo(1);
+            }
             try (var files = java.nio.file.Files.list(spillDirectory)) {
                 assertThat(files.toList()).isEmpty();
             }
             verify(connection).archiveLogsForRange(92, 110);
             verify(connection).archiveLogsForRange(92, 120);
-            verify(connection, times(4)).endLogMining();
+            verify(connection, times(3)).endLogMining();
         }
 
         @ParameterizedTest
-        @ValueSource(booleans = { false, true })
-        void shouldKeepTheReplayPositionWhenArchivesOrForwardMiningAreUnavailable(boolean archiveMissing) throws Exception {
+        @ValueSource(strings = { "memory", "hybrid" })
+        void shouldReleaseAHistoricalRollbackWithoutNewRowsForTheRetainedTransaction(String bufferType) throws Exception {
             config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
-                    .with("log.mining.window.strategy", "fixed").build());
+                    .with("log.mining.buffer.type", bufferType).with("log.mining.buffer.memory.bytes", bufferType.equals("memory") ? 4096 : 768)
+                    .with("log.mining.buffer.spill.path", spillDirectory.toString()).build());
             createSource();
-            when(connection.latestArchivedLsn()).thenReturn(110L);
-            final var unavailable = new SQLException("historical range unavailable");
-            if (archiveMissing) {
-                doThrow(unavailable).when(connection).archiveLogsForRange(92, 110);
-            }
+            final var polls = new AtomicInteger();
+            when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+                if (polls.incrementAndGet() > 2) {
+                    running.set(false);
+                }
+                return 110L;
+            });
+            final var marker = new HashMap<String, Object>(Map.of("SCN", 98L, "XID", new byte[]{ 1 },
+                    "OPERATION_CODE", 36, "ROLL_BACK", 0, "RS_ID", "155"));
+            final List<Long> starts = new ArrayList<>();
             doAnswer(invocation -> {
                 final long start = invocation.getArgument(0);
-                if (start == 90) {
-                    records(List.of(dml(95, 92, 0, 1)));
+                final long end = invocation.getArgument(1);
+                starts.add(start);
+                if (end == 100) {
+                    // The mined suffix omits START and does not yet identify full rollback.
+                    records(List.of(dml(95, 0, 0, 1), marker));
                 }
                 else {
-                    throw unavailable;
+                    final var rolledBack = new HashMap<>(dml(95, 0, 0, 1));
+                    rolledBack.put("ROLL_BACK", 1);
+                    final var terminal = new HashMap<>(marker);
+                    terminal.put("ROLL_BACK", 1);
+                    terminal.put("RS_ID", "-1");
+                    // Only another transaction has new rows after 100. The old marker
+                    // can only be reconsidered by actually rereading the historical range.
+                    records(List.of(rolledBack, terminal, dml(105, 102, 108, 2), commit(108, 102, 2)).stream()
+                            .filter(row -> (long) row.get("SCN") >= start).toList());
                 }
                 return null;
             }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
@@ -819,23 +837,20 @@ class DamengStreamingChangeEventSourceTest {
 
             source.execute(context, new DamengPartition("dm"), offset);
 
-            assertThat(failure.get()).isSameAs(unavailable);
-            assertThat(delivered).isEmpty();
-            assertThat(offset.getLsn()).isEqualTo(92);
-            assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
-            assertThat(metrics.getOldestReplayLsn()).isEqualTo(92);
-            if (archiveMissing) {
-                verify(connection, times(1)).startLogMining(anyLong(), anyLong(), eq(false));
-            }
-            else {
-                verify(connection).startLogMining(101, 110, false);
-                verify(connection, times(2)).endLogMining();
+            assertThat(failure.get()).isNull();
+            assertThat(offset.getLsn()).isEqualTo(110);
+            assertThat(metrics.getOpenTransactions()).isZero();
+            assertThat(starts).containsExactly(90L, 95L);
+            assertThat(delivered).extracting(value -> value.get("change_lsn")).containsExactly(105L);
+            assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
+            try (var files = java.nio.file.Files.list(spillDirectory)) {
+                assertThat(files.toList()).isEmpty();
             }
         }
 
         @ParameterizedTest
         @ValueSource(booleans = { false, true })
-        void shouldKeepTheReplayPositionWhenHistoricalReconstructionIsUnavailable(boolean archiveMissing) throws Exception {
+        void shouldKeepTheReplayPositionWhenArchivesOrProactiveMiningAreUnavailable(boolean archiveMissing) throws Exception {
             config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
                     .with("log.mining.window.strategy", "fixed").build());
             createSource();
@@ -848,9 +863,6 @@ class DamengStreamingChangeEventSourceTest {
                 final long start = invocation.getArgument(0);
                 if (start == 90) {
                     records(List.of(dml(95, 92, 0, 1)));
-                }
-                else if (start == 101) {
-                    records(List.of(commit(105, 0, 1)));
                 }
                 else {
                     throw unavailable;
@@ -871,8 +883,92 @@ class DamengStreamingChangeEventSourceTest {
             }
             else {
                 verify(connection).startLogMining(92, 110, false);
-                verify(connection, times(3)).endLogMining();
+                verify(connection, times(2)).endLogMining();
             }
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = { "fetch", "cleanup" })
+        void shouldKeepTheReplayPositionWhenProactiveReadFailsAfterReadingRows(String stage) throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10)
+                    .with("log.mining.window.strategy", "fixed").build());
+            createSource();
+            when(connection.latestArchivedLsn()).thenReturn(110L);
+            final var unavailable = new SQLException("historical range unavailable");
+            doAnswer(invocation -> {
+                final long start = invocation.getArgument(0);
+                if (start == 90) {
+                    records(List.of(dml(95, 92, 0, 1)));
+                }
+                else {
+                    records(List.of(dml(95, 92, 105, 1), commit(105, 92, 1)));
+                    if (stage.equals("fetch")) {
+                        doReturn(95L).doThrow(unavailable).when(rows).getLong("SCN");
+                    }
+                    else {
+                        doThrow(unavailable).when(connection).endLogMining();
+                    }
+                }
+                return null;
+            }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isSameAs(unavailable);
+            assertThat(delivered).isEmpty();
+            assertThat(offset.getLsn()).isEqualTo(92);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
+            assertThat(metrics.getOldestReplayLsn()).isEqualTo(92);
+            assertThat(offset.getCommitLsn()).isEqualTo(90);
+            verify(connection).startLogMining(92, 110, false);
+            verify(connection, times(2)).endLogMining();
+        }
+
+        @Test
+        void shouldResumePartialDispatchOfAProactivelyRebuiltTransaction() throws Exception {
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 10).build());
+            createSource();
+            doReturn(110L).when(connection).latestArchivedLsn();
+            final List<Long> starts = new ArrayList<>();
+            doAnswer(invocation -> {
+                final long start = invocation.getArgument(0);
+                final long end = invocation.getArgument(1);
+                starts.add(start);
+                if (end == 100) {
+                    records(List.of(dml(95, 92, 0, 1)));
+                }
+                else {
+                    records(List.of(dml(95, 92, 108, 1), dml(105, 92, 108, 1), commit(108, 92, 1)).stream()
+                            .filter(row -> (long) row.get("SCN") >= start).toList());
+                }
+                return null;
+            }).when(connection).startLogMining(anyLong(), anyLong(), eq(false));
+            final var offset = new DamengOffsetContext(config, 90);
+            stopAfter = 1;
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(starts).containsExactly(90L, 92L);
+            assertThat(offset.getLsn()).isEqualTo(92);
+            assertThat(offset.getCommitLsn()).isEqualTo(108);
+            assertThat(offset.getEventSerialNo()).isZero();
+
+            final var restored = new DamengOffsetContext.Loader(config).load(new HashMap<>(offset.getOffset()));
+            starts.clear();
+            running.set(true);
+            stopAfter = 2;
+            // Restart begins at the persisted replay floor, with an empty buffer.
+            config = new DamengConnectorConfig(config.getConfig().edit().with("log.mining.batch.size", 100).build());
+            createSource();
+            source.execute(context, new DamengPartition("dm"), restored);
+
+            assertThat(failure.get()).isNull();
+            assertThat(starts).containsExactly(92L);
+            assertThat(delivered).extracting(value -> value.get("change_lsn")).containsExactly(95L, 105L);
+            assertThat(delivered.get(1)).containsEntry("event_serial_no", 1L);
+            assertThat(restored.getEventSerialNo()).isEqualTo(Long.MAX_VALUE);
         }
 
         @Test
@@ -917,15 +1013,15 @@ class DamengStreamingChangeEventSourceTest {
             final List<Long> starts = new ArrayList<>();
             doAnswer(invocation -> {
                 final long start = invocation.getArgument(0);
+                final long end = invocation.getArgument(1);
                 starts.add(start);
-                if (start == 90) {
+                if (end == 100) {
                     records(List.of(dml(95, 92, 0, 1), dml(96, 94, 98, 2), commit(98, 94, 2)));
                 }
-                else if (start == 101) {
-                    records(List.of(dml(105, 102, 108, 3), commit(108, 102, 3)));
-                }
-                else if (start == 111) {
-                    records(List.of(dml(113, 112, 0, 4), commit(115, 0, 1)));
+                else if (end == 110) {
+                    records(List.of(dml(95, 92, 0, 1), dml(96, 94, 98, 2), commit(98, 94, 2),
+                            dml(105, 102, 108, 3), commit(108, 102, 3)).stream()
+                            .filter(row -> (long) row.get("SCN") >= start).toList());
                 }
                 else if (start == 92) {
                     // The checkpoint transaction remains eligible for END cleanup, alongside the completing and open transactions.
@@ -942,12 +1038,12 @@ class DamengStreamingChangeEventSourceTest {
             source.execute(context, new DamengPartition("dm"), offset);
 
             assertThat(failure.get()).isNull();
-            assertThat(starts).containsExactly(90L, 101L, 111L, 92L);
+            assertThat(starts).containsExactly(90L, 92L, 92L);
             assertThat(delivered).extracting(value -> value.get("change_lsn")).containsExactly(96L, 105L, 95L);
             assertThat(offset.getLsn()).isEqualTo(112);
             assertThat(offset.getCommitLsn()).isEqualTo(115);
             assertThat(metrics.getOpenTransactions()).isEqualTo(1);
-            assertThat(metrics.getReconstructionSessions()).isEqualTo(1);
+            assertThat(metrics.getReconstructionSessions()).isEqualTo(2);
             assertThat(metrics.getBufferLimitFailures()).isZero();
         }
 
@@ -966,6 +1062,29 @@ class DamengStreamingChangeEventSourceTest {
             assertThat(metrics.getLatestArchivedLsn()).isEqualTo(90);
             assertThat(delivered).isEmpty();
             verify(connection, never()).startLogMining(anyLong(), anyLong(), anyBoolean());
+        }
+
+        @Test
+        void shouldWaitForArchiveProgressBeforeRereadingARetainedTransaction() throws Exception {
+            records(List.of(dml(95, 92, 0, 1)));
+            final var polls = new AtomicInteger();
+            when(connection.latestArchivedLsn()).thenAnswer(invocation -> {
+                if (polls.incrementAndGet() > 1) {
+                    running.set(false);
+                }
+                return 100L;
+            });
+            final var offset = new DamengOffsetContext(config, 90);
+
+            source.execute(context, new DamengPartition("dm"), offset);
+
+            assertThat(failure.get()).isNull();
+            assertThat(offset.getLsn()).isEqualTo(92);
+            assertThat(metrics.getScannedUpperLsn()).isEqualTo(100);
+            assertThat(metrics.getOpenTransactions()).isEqualTo(1);
+            assertThat(metrics.getReconstructionSessions()).isZero();
+            verify(connection, times(1)).startLogMining(90, 100, false);
+            verify(connection, times(1)).endLogMining();
         }
 
         @Test

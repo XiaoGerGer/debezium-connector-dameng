@@ -749,7 +749,8 @@ Connector 只读取归档 REDO，未归档尾部会增加延迟。LSN 是日志�
 文件预算包含已扫描部分和预分配空间，不等于实际 I/O 或堆占用。单文件、共享边界和事务重建可以超出预算；到归档尾部立即处理可读范围，不等凑满预算。
 所选文件 LEN 缺失或非正值时停止，可核查归档视图或显式使用 fixed。归档缺口、混入其他来源或重叠异常同样停止。
 
-未完成事务跨窗口保留，并固定安全重放起点。遇到跨窗口提交或回滚边界时，Connector 从最老安全位置重建事务，排除已回滚行，再按提交顺序发布。
+未完成事务固定安全重放起点。每轮有新的安全归档进度且存在遗留事务时，Connector 主动从该位置到本轮新上界完整重读，在读取前释放旧事务缓存并重建，排除已回滚行，再按提交顺序发布。
+新上界始终从上次扫描位置向前选择，历史重读不受新增归档预算截断；没有新进度时等待。长事务会增加重复挖掘开销。
 支持 SAVEPOINT 的有效结果恢复。长事务落盘后仍依赖旧归档，必须保留到安全重放位置推进。
 
 旧 adaptive 模式已删除。升级前移除 `log.mining.window.adaptive.enabled`、`log.mining.batch.size.min`、`log.mining.batch.size.max`、`log.mining.window.target.ms`，否则配置校验失败。
@@ -1458,7 +1459,7 @@ Exporter 只导出已配置的 JMX 属性，Grafana 使用导出指标和 record
 |`MiningWindowByteBudget` |archive_bytes 文件字节软预算；其他策略为 0。JMX reset 保留。
 |`SelectedArchiveFileBytes`、`SelectedArchiveFileCount` |选窗时所需前向文件的完整 LEN 总和/文件数，含共享边界文件，不含后续重建或实际 I/O；空闲保留，JMX reset 清零。
 |`ForwardMiningDurationMillis`、`ReconstructionDurationMillis`、`DispatchDurationMillis` |成功完成轮次的累计阶段毫秒。前进含会话建立/清理，重建含历史重读和缓存替换，分发含解析转换及入队，不含 Kafka 确认。失败/中断轮次不计入。
-|`LastForwardMiningDurationMillis`、`LastReconstructionDurationMillis`、`LastDispatchDurationMillis` |最近成功完成轮次的阶段毫秒；未重建时最近重建时间为 0。
+|`LastForwardMiningDurationMillis`、`LastReconstructionDurationMillis`、`LastDispatchDurationMillis` |最近成功完成轮次的阶段毫秒；主动重读轮次的完整扫描计入重建时间，前进时间为 0；未重建时重建时间为 0。
 |`LatestArchivedLsn`、`ScannedUpperLsn`、`OldestReplayLsn` |最近观察的归档上界、已完成扫描上界和最老安全重放位置；不是同一个进度。
 |`StandbyReplayableLsn`、`StandbyReplayedLsn`、`StandbyMiningUpperLsn` |备库允许重放、已经重放完成和实际允许挖掘的位置；非备库采集时为 0。挖掘上界取归档与两个重放位置的最小值，LSN 差不能当作时间延迟。
 |`OpenTransactions` |最近一次扫描完成/失败/中断采样时仍需重放的事务数，不是每次数据库提交即时更新。

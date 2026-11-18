@@ -155,42 +155,42 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                     continue;
                 }
                 final long replayLsn = offset.getLsn();
-                final long start = firstWindow ? replayLsn : scannedThrough + 1;
+                // Plan new progress independently of any historical reread. Using
+                // replayLsn here can repeatedly select the same oversized archive.
+                final long forwardStart = firstWindow ? replayLsn : scannedThrough + 1;
                 final long end;
                 if (archiveWindows) {
-                    final var selected = LogMinerArchiveWindow.select(archives, start, scannedThrough, available, config.getLogMiningWindowMaxBytes());
+                    final var selected = LogMinerArchiveWindow.select(archives, forwardStart, scannedThrough, available, config.getLogMiningWindowMaxBytes());
                     end = selected.endLsn();
                     metrics.onArchiveWindowSelected(selected, end - scannedThrough, config.getLogMiningWindowMaxBytes());
                     LOGGER.debug("Dameng archive window start={}, end={}, files={}, fileBytes={}, budgetBytes={}",
-                            start, end, selected.fileCount(), selected.fileBytes(), config.getLogMiningWindowMaxBytes());
+                            forwardStart, end, selected.fileCount(), selected.fileBytes(), config.getLogMiningWindowMaxBytes());
                 }
                 else {
                     end = scannedThrough + Math.min(available - scannedThrough, config.getLogMiningBatchSize());
                 }
                 final long actualSpan = end - scannedThrough;
+                final boolean reconstructed = !firstWindow && buffer.openTransactions() > 0;
+                final long readStart = reconstructed ? replayLsn : forwardStart;
                 metrics.onWindowStarted(replayLsn, scannedThrough, archived);
                 final long windowStarted = System.nanoTime();
-                if (replayLsn < start) {
+                if (replayLsn < forwardStart) {
                     // Temporary transaction files do not replace the archives needed on restart.
                     connection.archiveLogsForRange(replayLsn, end);
                 }
-                readBatch(context, start, end, buffer, false);
-                final long forwardNanos = System.nanoTime() - windowStarted;
+                if (reconstructed) {
+                    // DM can revise historical rollback flags without returning new
+                    // rows for this XID. Rebuild proactively instead of waiting for a
+                    // terminal event in the forward range; never append reread rows
+                    // to the provisional cache, even when it has spilled.
+                    buffer.resetForReconstruction();
+                }
+                readBatch(context, readStart, end, buffer, reconstructed);
+                final long miningNanos = System.nanoTime() - windowStarted;
+                final long forwardNanos = reconstructed ? 0 : miningNanos;
+                final long reconstructionNanos = reconstructed ? miningNanos : 0;
                 if (!context.isRunning()) {
                     return;
-                }
-                final boolean reconstructed = buffer.requiresReconstruction();
-                long reconstructionNanos = 0;
-                if (reconstructed) {
-                    // The old cache is provisional, even when it has spilled.
-                    // Replace it with the final rollback view before any dispatch.
-                    final long reconstructionStarted = System.nanoTime();
-                    buffer.resetForReconstruction();
-                    readBatch(context, replayLsn, end, buffer, true);
-                    reconstructionNanos = System.nanoTime() - reconstructionStarted;
-                    if (!context.isRunning()) {
-                        return;
-                    }
                 }
                 // A graceful switchover can demote a still-connected session.
                 // Validate before publishing the window instead of mining a standby.
@@ -222,8 +222,8 @@ public final class DamengStreamingChangeEventSource implements StreamingChangeEv
                 scannedThrough = end;
                 firstWindow = false;
                 metrics.setOldestReplayLsn(offset.getLsn());
-                LOGGER.debug("Dameng window completed: start={}, end={}, replayLsn={}, commitLsn={}, reconstructed={}, openTransactions={}",
-                        start, end, offset.getLsn(), offset.getCommitLsn(), reconstructed, buffer.openTransactions());
+                LOGGER.debug("Dameng window completed: forwardStart={}, readStart={}, end={}, replayLsn={}, commitLsn={}, reconstructed={}, openTransactions={}",
+                        forwardStart, readStart, end, offset.getLsn(), offset.getCommitLsn(), reconstructed, buffer.openTransactions());
                 dispatcher.dispatchHeartbeatEvent(partition, offset);
                 metrics.onIterationCompleted(actualSpan, forwardNanos, reconstructionNanos, dispatchNanos);
             }
