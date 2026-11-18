@@ -18,110 +18,16 @@ import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.slf4j.LoggerFactory;
 
 import io.debezium.connector.dameng.DamengConnectorConfig.LogMiningBufferType;
 import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer.DispatchProgress;
 import io.debezium.connector.dameng.logminer.events.EventType;
 
-import ch.qos.logback.classic.Level;
-import ch.qos.logback.classic.Logger;
-import ch.qos.logback.classic.spi.ILoggingEvent;
-import ch.qos.logback.core.read.ListAppender;
-
 class LogMinerTransactionBufferTest {
     @TempDir
     Path directory;
-
-    @ParameterizedTest
-    @MethodSource("unmatchedRollbackRecordSetIds")
-    void shouldDiagnoseRawRollbackMarkerAndTheOldestRetainedTransactionWithoutSql(String rsId, String length, String utf8) {
-        try (var logs = new BufferLogs(); var buffer = buffer(4096)) {
-            buffer.add(row("newer", 21, 20, 1, 0, "private-business-value"));
-            buffer.add(row("oldest", 31, 10, 1, 1, "private-business-value"));
-            buffer.add(row("oldest", 32, 10, 36, 1, null, rsId));
-
-            assertThat(buffer.completeWindow(40)).isEqualTo(10);
-            assertThat(buffer.openTransactions()).isEqualTo(2);
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng rollback marker:",
-                    "xid=oldest", "scn=32", "operation=36", "rollback=1", "rsIdLength=" + length, "rsIdUtf8=" + utf8,
-                    "cached=true", "previousFullRollbackMarker=false", "matchedFullRollback=false"));
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng replay retained:",
-                    "end=40", "replayLsn=10", "oldestXid=oldest", "commitLsn=0", "fullRollbackMarker=false",
-                    "records=0", "retainedTransactions=2", "openTransactions=2"));
-            assertThat(logs.messages()).noneMatch(message -> message.contains("private-business-value"));
-        }
-    }
-
-    static List<Arguments> unmatchedRollbackRecordSetIds() {
-        return List.of(Arguments.of("-1 ", "3", "2d3120"), Arguments.of("-1\u0000", "3", "2d3100"), Arguments.of(null, "null", "null"));
-    }
-
-    @Test
-    void shouldDiagnoseMarkerReplacementReconstructionAndFullRollbackRelease() {
-        try (var logs = new BufferLogs(); var buffer = buffer(4096)) {
-            buffer.add(row("a", 10, 0, 1, 1, "private-business-value"));
-            buffer.add(row("a", 11, 0, 36, 1, null));
-            buffer.add(row("a", 12, 0, 36, 1, null, "9"));
-            assertThat(buffer.completeWindow(20)).isEqualTo(10);
-            assertThat(buffer.openTransactions()).isEqualTo(1);
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng rollback marker:",
-                    "xid=a", "scn=12", "previousFullRollbackMarker=true", "matchedFullRollback=false"));
-
-            buffer.resetForReconstruction();
-            buffer.add(row("a", 10, 0, 1, 1, "private-business-value"));
-            buffer.add(row("a", 11, 0, 36, 1, null));
-            assertThat(buffer.completeWindow(20)).isEqualTo(20);
-            assertThat(buffer.openTransactions()).isZero();
-            assertThat(buffer.memoryBytes()).isZero();
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng transaction reconstruction reset:",
-                    "retainedTransactions=1", "openTransactions=1"));
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng full rollback released:",
-                    "xid=a", "startLsn=10", "records=0"));
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng replay advanced:", "replayLsn=20"));
-            assertThat(logs.messages()).noneMatch(message -> message.contains("private-business-value"));
-        }
-    }
-
-    @Test
-    void shouldDiagnoseUnmatchedTerminalRollbackBeforeBaselineDiscard() {
-        try (var logs = new BufferLogs(); var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576, 100)) {
-            buffer.add(row("old", 120, 0, 36, 1, null));
-            assertThat(buffer.completeWindow(130)).isEqualTo(130);
-            assertThat(buffer.memoryBytes()).isZero();
-            assertThat(logs.messages()).anySatisfy(message -> assertThat(message).contains("Dameng rollback marker:",
-                    "xid=old", "scn=120", "rsIdLength=2", "rsIdUtf8=2d31", "cached=false",
-                    "previousFullRollbackMarker=null", "matchedFullRollback=true"));
-            assertThat(logs.messages()).noneMatch(message -> message.contains("Dameng full rollback released:"));
-        }
-    }
-
-    private static final class BufferLogs implements AutoCloseable {
-        private final Logger logger = (Logger) LoggerFactory.getLogger(LogMinerTransactionBuffer.class);
-        private final Level previous = logger.getLevel();
-        private final ListAppender<ILoggingEvent> appender = new ListAppender<>();
-
-        private BufferLogs() {
-            appender.start();
-            logger.addAppender(appender);
-            logger.setLevel(Level.DEBUG);
-        }
-
-        private List<String> messages() {
-            return appender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
-        }
-
-        @Override
-        public void close() {
-            logger.detachAppender(appender);
-            logger.setLevel(previous);
-            appender.stop();
-        }
-    }
 
     @Test
     void shouldRetainAndReleaseExactlyTheMemoryBudgetWithoutCreatingSpillStorage() throws Exception {

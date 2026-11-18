@@ -5,11 +5,9 @@
  */
 package io.debezium.connector.dameng.logminer;
 
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -179,16 +177,6 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             throw new IllegalStateException("Missing Dameng transaction id at LSN " + row.lsn());
         }
         Transaction tx = transactions.get(row.transactionId());
-        if (eventType == EventType.ROLLBACK && LOGGER.isDebugEnabled()) {
-            final String rsId = row.recordSetId();
-            // Hex preserves whitespace/nonprinting characters hidden by SQL clients.
-            // Log before the unmatched-terminal check so discarded markers remain visible.
-            LOGGER.debug("Dameng rollback marker: xid={}, scn={}, startScn={}, operation={}, rollback={}, rsIdLength={}, rsIdUtf8={}, "
-                    + "cached={}, previousFullRollbackMarker={}, matchedFullRollback={}",
-                    row.transactionId(), row.lsn(), row.startLsn(), row.operation(), row.rollback(),
-                    rsId == null ? null : rsId.length(), rsId == null ? null : HexFormat.of().formatHex(rsId.getBytes(StandardCharsets.UTF_8)),
-                    tx != null, tx == null ? null : tx.fullRollbackMarker, row.rollback() == 1 && "-1".equals(rsId));
-        }
         if (tx == null) {
             if (baselineLsn > 0 && row.startLsn() == 0 && (eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT ||
                     (eventType == EventType.ROLLBACK && row.rollback() == 1 && "-1".equals(row.recordSetId())))) {
@@ -279,7 +267,6 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     /** Discard provisional images before rebuilding the entire safe replay range. */
     public void resetForReconstruction() {
         finishWindow();
-        LOGGER.debug("Dameng transaction reconstruction reset: retainedTransactions={}, openTransactions={}", transactions.size(), openTransactions);
         for (var tx : List.copyOf(transactions.values())) {
             release(tx);
         }
@@ -408,25 +395,11 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         requireValidatedHistory();
         for (var tx : transactions.values().stream().filter(Transaction::isFullyRolledBack).toList()) {
             release(tx);
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("Dameng full rollback released: xid={}, startLsn={}, records={}", tx.id, tx.startLsn, tx.recordCount);
-            }
         }
         transactions.values().forEach(tx -> tx.carried = true);
         initialWindow = false;
         dispatchProgress = null;
-        final Transaction oldest = transactions.values().stream().min(Comparator.comparingLong(tx -> tx.startLsn)).orElse(null);
-        if (oldest == null) {
-            LOGGER.debug("Dameng replay advanced: end={}, replayLsn={}, retainedTransactions=0", end, end);
-            return end;
-        }
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Dameng replay retained: end={}, replayLsn={}, oldestXid={}, commitLsn={}, fullRollbackMarker={}, records={}, "
-                    + "memoryBytes={}, diskBytes={}, retainedTransactions={}, openTransactions={}",
-                    end, oldest.startLsn, oldest.id, oldest.commitLsn, oldest.fullRollbackMarker, oldest.recordCount,
-                    oldest.memoryBytes + oldest.metadataBytes, oldest.diskBytes, transactions.size(), openTransactions);
-        }
-        return oldest.startLsn;
+        return transactions.values().stream().mapToLong(tx -> tx.startLsn).min().orElse(end);
     }
 
     public long memoryBytes() {
