@@ -1021,7 +1021,7 @@ Parser, snapshot, incremental snapshot, capture-scope and schema-history tests c
 * Snapshot a source, stop the engine, create CTAS/LIKE/CAST/storage and HASH/RANGE/LIST tables, then alter the source before replay.
   Assert copied row values, key/default semantics and subsequent UPDATE/DELETE images across another restart.
 * Change the nested-comment setting during idle streaming and while stopped, assert rejection, then restore it without writing affected DDL and verify recovery.
-* Reject virtual columns and temporary/HUGE table snapshot metadata, and reject column names differing only by case.
+* Reject virtual columns and temporary/HUGE table snapshot metadata, and reject column names differing only by case. This describes the historical run: the current JDBC metadata check logs a WARN and continues for column names differing only by case, without automatically skipping the table. Reliable capture of both columns remains unsupported.
 * Preserve quoted mixed-case table/column names through snapshot, an offline column rename and streaming recovery.
 
 `DamengDdlExtensionsProbeIT` retains SQL acceptance, JDBC metadata and raw LogMiner evidence under `target/dameng-p1-evidence`.

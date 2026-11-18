@@ -75,7 +75,7 @@ Explicit standby capture requires a build with standby LogMiner support and a re
 
 [[dameng-case-sensitive]]
 `CASE_SENSITIVE=0` normalizes schema, table, column and constraint names to uppercase, including topic and field names; data values are unchanged.
-With `CASE_SENSITIVE=1`, unquoted names become uppercase and double-quoted names retain case. Columns differing only by case within one table are still rejected.
+With `CASE_SENSITIVE=1`, unquoted names become uppercase and double-quoted names retain case. For columns differing only by case within one table, the JDBC metadata check logs a WARN and continues processing without automatically skipping the table. The shared column model remains case-insensitive, so columns can overwrite one another or values can be assigned to the wrong column; reliable capture of both columns is not supported.
 Filters and snapshot requests use these normalized `schema.table` names. Signal table names are normalized automatically.
 
 [id="dameng-database-setup"]

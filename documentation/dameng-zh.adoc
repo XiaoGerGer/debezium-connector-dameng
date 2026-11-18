@@ -115,7 +115,7 @@ MySQL 模式的 ALTER 使用 `MODIFY`、`RENAME COLUMN`、`ADD`，不支持 `MOD
 `CASE_SENSITIVE` 是建库属性，Connector 自动读取：
 
 * `0`：schema、表、列和约束统一为大写；Topic 中的 schema/table 和消息字段名也使用大写，数据值不变。
-* `1`：非引号名转大写，双引号名保留大小写。同表列名仅大小写不同仍拒绝。
+* `1`：非引号名转大写，双引号名保留大小写。同表列名仅大小写不同时，JDBC 元数据检查记录 WARN 后继续处理，不自动跳过该表。公共列模型仍不区分大小写，可能发生列覆盖或数据错配，尚不支持可靠采集这类双列。
 
 过滤正则、列配置和增量快照表名须使用上述名称。`signal.data.collection` 自动规范化，并始终按 `schema.table` 解析。
 例如模式 0 下的 `"Dbz_App"."Dbz_Case"`、列 `"VaLuE"` 对应 Topic `prefix.DBZ_APP.DBZ_CASE` 和字段 `VALUE`。

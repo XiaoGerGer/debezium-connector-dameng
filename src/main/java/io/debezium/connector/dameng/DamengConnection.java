@@ -923,9 +923,9 @@ public class DamengConnection extends JdbcConnection {
                                                            TableFilter tableFilter, ColumnNameFilter columnFilter, DatabaseMetaData metadata,
                                                            Set<TableId> viewIds)
             throws SQLException {
-        // The common table model indexes columns without case sensitivity. Never
-        // let a valid DM table with "id" and "ID" silently lose a column.
-        return super.getColumnsDetails(catalogName, schemaName, tableName, tableFilter, columnFilter, metadata, viewIds, true);
+        // Use the common JDBC warning-only policy for columns that differ only by case.
+        // The common table model still does not support distinct case-only column names.
+        return super.getColumnsDetails(catalogName, schemaName, tableName, tableFilter, columnFilter, metadata, viewIds, false);
     }
 
     @Override

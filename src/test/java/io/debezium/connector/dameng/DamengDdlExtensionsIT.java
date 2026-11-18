@@ -34,11 +34,17 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
 import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
+import io.debezium.jdbc.JdbcConnection;
+import io.debezium.junit.logging.LogInterceptor;
+import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 import io.debezium.storage.file.history.FileSchemaHistory;
+
+import ch.qos.logback.classic.Logger;
 
 /** P1 acceptance on the original DM image, including offline DDL and durable recovery. */
 class DamengDdlExtensionsIT extends AbstractAsyncEngineConnectorTest {
@@ -330,12 +336,19 @@ class DamengDdlExtensionsIT extends AbstractAsyncEngineConnectorTest {
     }
 
     @Test
-    void shouldRejectSnapshotColumnsThatDifferOnlyByCase() throws Exception {
+    void shouldWarnAndContinueSchemaDiscoveryForColumnsThatDifferOnlyByCase() throws Exception {
         create("_CASE", "(\"id\" INT,\"ID\" INT)");
+        final var logs = LogInterceptor.forClass(JdbcConnection.class);
         try (var connection = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
                 .with("password", DamengTestDatabase.password()).build())) {
-            assertThatThrownBy(() -> connection.readSchema(new Tables(), null, "SYSDBA", id -> id.table().equals(prefix + "_CASE"), null, false))
-                    .hasMessageContaining("columns that differ only by case");
+            final var tables = new Tables();
+            connection.readSchema(tables, null, "SYSDBA", id -> id.table().equals(prefix + "_CASE"), null, false);
+            assertThat(tables.forTable(new TableId(null, "SYSDBA", prefix + "_CASE"))).isNotNull();
+            assertThat(logs.containsWarnMessage("columns that differ only by case")).isTrue();
+        }
+        finally {
+            logs.stop();
+            ((Logger) LoggerFactory.getLogger(JdbcConnection.class)).detachAppender(logs);
         }
     }
 
