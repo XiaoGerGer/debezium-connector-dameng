@@ -192,11 +192,6 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
                 throw capacityFailure("Dameng pending transaction metadata exceeds log.mining.buffer.memory.bytes=" + memoryLimit);
             }
             tx = new Transaction(row, metadata);
-            // Recovery drains captured writers; intent snapshots explicitly omit
-            // pre-baseline operations. Both reconstruct only the retained suffix,
-            // even when LogMiner omits its START. Archive continuity is still
-            // validated on every read.
-            tx.baselineSuffix = baselineLsn > 0 && eventType != EventType.START && row.startLsn() < baselineLsn;
             transactions.put(tx.id, tx);
             memoryBytes += metadata;
         }
@@ -213,19 +208,14 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
                 }
             }
             case ROLLBACK -> {
-                // Tested DM versions use RS_ID=-1 for the terminal full rollback.
-                // START itself can be marked rolled back by ROLLBACK TO an early
-                // savepoint, so neither START nor operation 36 alone ends a tx.
-                // Unknown marker forms remain pending rather than losing history.
+                // Tested DM versions identify terminal full rollback with operation
+                // 36, ROLL_BACK=1 and RS_ID=-1, even when the mined range omits START.
+                // Other rollback markers do not establish transaction completion.
                 tx.fullRollbackMarker = row.rollback() == 1 && "-1".equals(row.recordSetId());
-                if (tx.baselineSuffix && tx.fullRollbackMarker) {
-                    tx.startRolledBack = true;
-                }
             }
             case START -> {
-                // Use only together with the terminal full rollback marker and
-                // an empty final image, never as a standalone completion signal.
-                tx.startRolledBack = row.rollback() != 0;
+                // The start position is recorded above. START is not a data row,
+                // and its rollback flag does not establish transaction completion.
             }
             case PRE_COMMIT -> {
                 // PRE_COMMIT alone does not complete a transaction.
@@ -430,9 +420,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         private final long metadataBytes;
         private long startLsn;
         private long commitLsn;
-        private boolean baselineSuffix;
         private boolean fullRollbackMarker;
-        private boolean startRolledBack;
         private boolean carried;
         private List<LogMinerRow> rows = new ArrayList<>();
         private Path file;
@@ -452,7 +440,8 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         }
 
         private boolean isFullyRolledBack() {
-            return commitLsn == 0 && startRolledBack && fullRollbackMarker && recordCount == 0;
+            // Full rollback discards all buffered data, including provisional rows.
+            return commitLsn == 0 && fullRollbackMarker;
         }
 
         public long commitLsn() {

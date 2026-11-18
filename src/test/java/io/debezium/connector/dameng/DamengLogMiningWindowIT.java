@@ -8,9 +8,11 @@ package io.debezium.connector.dameng;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.file.Path;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
@@ -19,13 +21,21 @@ import java.util.UUID;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.dameng.DamengConnectorConfig.LogMiningBufferType;
+import io.debezium.connector.dameng.logminer.LogMinerRow;
+import io.debezium.connector.dameng.logminer.LogMinerTransactionBuffer;
 
 /** Verifies transaction boundaries and rollback visibility across real LogMiner sessions. */
 class DamengLogMiningWindowIT {
+    @TempDir
+    Path directory;
+
     @BeforeAll
     static void startDatabase() throws Exception {
         DamengTestDatabase.start();
@@ -217,6 +227,56 @@ class DamengLogMiningWindowIT {
                             assertThat(row.operation()).isEqualTo(7);
                         });
                     }
+                }
+            }
+            finally {
+                writer.rollback();
+                miner.execute("DROP TABLE " + table);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldReleaseFullRollbackMinedWithoutItsStart(LogMiningBufferType type) throws Exception {
+        final var table = DamengTestDatabase.schema() + ".DBZ_SUFFIX_" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        try (var miner = new DamengConnection(Configuration.create().with("hosts", DamengTestDatabase.hosts()).with("user", DamengTestDatabase.user())
+                .with("password", DamengTestDatabase.password()).build());
+                var writer = DriverManager.getConnection(DamengTestDatabase.jdbcUrl(), DamengTestDatabase.user(), DamengTestDatabase.password())) {
+            miner.execute("CREATE TABLE " + table + " (ID INT PRIMARY KEY, NAME VARCHAR(30))");
+            try {
+                writer.setAutoCommit(false);
+                final long start = miner.currentLsn();
+                try (var statement = writer.createStatement()) {
+                    statement.execute("INSERT INTO " + table + " VALUES(1,'rollback suffix')");
+                }
+                final var before = mine(miner, start, miner.currentLsn());
+                final var inserted = before.stream().filter(row -> row.operation() == 1 && row.sql() != null && row.sql().contains("'rollback suffix'"))
+                        .findFirst().orElseThrow();
+                assertThat(inserted.startLsn()).isPositive();
+                writer.rollback();
+                final long end = miner.currentLsn();
+                final var suffix = mine(miner, inserted.startLsn() + 1, end).stream().filter(row -> row.xid().equals(inserted.xid())).toList();
+                assertThat(suffix).isNotEmpty().allSatisfy(row -> {
+                    assertThat(row.operation()).isNotEqualTo(6);
+                    assertThat(row.startLsn()).isZero();
+                });
+                assertThat(suffix).anySatisfy(row -> {
+                    assertThat(row.operation()).isEqualTo(36);
+                    assertThat(row.rollback()).isEqualTo(1);
+                    assertThat(row.recordSetId()).isEqualTo("-1");
+                });
+                try (var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576, 0, type)) {
+                    for (var row : suffix) {
+                        buffer.add(new LogMinerRow(row.lsn(), row.startLsn(), row.commitLsn(), row.xid(), row.operation(), row.rollback(),
+                                null, null, null, row.sql(), row.recordSetId(), 0, 0, Instant.EPOCH));
+                    }
+                    assertThat(buffer.committedTransactions()).isEmpty();
+                    assertThat(buffer.completeWindow(end)).isEqualTo(end);
+                    assertThat(buffer.openTransactions()).isZero();
+                    assertThat(buffer.bufferedRecords()).isZero();
+                    assertThat(buffer.memoryBytes()).isZero();
+                    assertThat(buffer.diskBytes()).isZero();
                 }
             }
             finally {

@@ -445,6 +445,122 @@ class LogMinerTransactionBufferTest {
 
     @ParameterizedTest
     @EnumSource(LogMiningBufferType.class)
+    void shouldReleaseFullRollbackSuffixWithoutStart(LogMiningBufferType type) throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576, 0, type)) {
+            buffer.add(row("a", 180, 0, 1, 1, "discard"));
+            buffer.add(row("a", 200, 0, 36, 1, null));
+
+            assertThat(buffer.committedTransactions()).isEmpty();
+            assertThat(buffer.completeWindow(210)).isEqualTo(210);
+            assertThat(buffer.openTransactions()).isZero();
+            assertThat(buffer.bufferedRecords()).isZero();
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.diskBytes()).isZero();
+        }
+        assertEmptyDirectory();
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldReleaseFullRollbackWhenOnlyTheTerminalRecordIsReplayed(LogMiningBufferType type) throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576, 0, type)) {
+            buffer.add(row("a", 200, 0, 36, 1, null));
+
+            assertThat(buffer.completeWindow(210)).isEqualTo(210);
+            assertThat(buffer.openTransactions()).isZero();
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.committedTransactions()).isEmpty();
+        }
+        assertEmptyDirectory();
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldDiscardNonemptyCacheOnFullRollback(LogMiningBufferType type) throws Exception {
+        // Exercise both START flag values independently of the cached row count.
+        for (int startRollback : List.of(0, 1)) {
+            try (var buffer = new LogMinerTransactionBuffer(type == LogMiningBufferType.MEMORY ? 4096 : 512,
+                    8192, 10, directory, 1048576, 0, type)) {
+                buffer.add(row("a", 10, 10, 6, startRollback, null));
+                buffer.add(row("a", 11, 10, 1, 0, "provisional data"));
+                assertThat(buffer.bufferedRecords()).isEqualTo(1);
+                assertThat(buffer.spilledTransactions()).isEqualTo(type == LogMiningBufferType.MEMORY ? 0 : 1);
+                buffer.add(row("a", 20, 10, 36, 1, null));
+                buffer.add(row("a", 20, 10, 36, 1, null));
+
+                assertThat(buffer.committedTransactions()).isEmpty();
+                assertThat(buffer.completeWindow(30)).isEqualTo(30);
+                assertThat(buffer.openTransactions()).isZero();
+                assertThat(buffer.bufferedRecords()).isZero();
+                assertThat(buffer.memoryBytes()).isZero();
+                assertThat(buffer.diskBytes()).isZero();
+                try (var files = Files.walk(directory)) {
+                    assertThat(files.filter(Files::isRegularFile).toList()).isEmpty();
+                }
+            }
+            assertEmptyDirectory();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldNotPinReplayWhenReconstructionReintroducesARolledBackSuffix(LogMiningBufferType type) throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576, 0, type)) {
+            buffer.add(row("a", 100, 100, 6, 1, null));
+            buffer.add(row("b", 150, 150, 6, 0, null));
+            buffer.add(row("a", 180, 100, 1, 1, "discard"));
+            buffer.add(row("a", 200, 100, 36, 1, null));
+            assertThat(buffer.completeWindow(210)).isEqualTo(150);
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+
+            buffer.beginWindow();
+            buffer.add(row("b", 230, 0, 7, 0, null));
+            assertThat(buffer.requiresReconstruction()).isTrue();
+            assertThatThrownBy(() -> buffer.completeWindow(240)).hasMessageContaining("must be reconstructed");
+            buffer.resetForReconstruction();
+            buffer.beginWindow();
+            // Rebuild [150, 240]: A's START is outside the retained range, even without a restart.
+            buffer.add(row("b", 150, 150, 6, 0, null));
+            buffer.add(row("a", 180, 0, 1, 1, "discard"));
+            buffer.add(row("a", 200, 0, 36, 1, null));
+            buffer.add(row("b", 230, 150, 7, 0, null));
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).extracting(LogMinerTransactionBuffer.Transaction::id).containsExactly("b");
+            buffer.release(committed.get(0));
+
+            assertThat(buffer.completeWindow(240)).isEqualTo(240);
+            assertThat(buffer.openTransactions()).isZero();
+            assertThat(buffer.memoryBytes()).isZero();
+            buffer.beginWindow();
+            assertThat(buffer.completeWindow(300)).isEqualTo(300);
+        }
+        assertEmptyDirectory();
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldRequireAllThreeFullRollbackMarkerFields(LogMiningBufferType type) throws Exception {
+        for (var marker : List.of(
+                row("a", 12, 10, 36, 1, null, "9"),
+                row("a", 12, 10, 36, 1, null, null),
+                row("a", 12, 10, 36, 0, null, "-1"),
+                row("a", 12, 10, 1, 1, "discard", "-1"))) {
+            try (var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576, 0, type)) {
+                buffer.add(row("a", 10, 10, 6, 1, null));
+                buffer.add(row("a", 11, 10, 1, 1, "discard"));
+                buffer.add(marker);
+
+                assertThat(buffer.bufferedRecords()).isZero();
+                assertThat(buffer.completeWindow(20)).isEqualTo(10);
+                assertThat(buffer.openTransactions()).isEqualTo(1);
+                assertThat(buffer.committedTransactions()).isEmpty();
+            }
+            assertEmptyDirectory();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
     void shouldReplaceProvisionalImagesWithTheFinalRollbackView(LogMiningBufferType type) throws Exception {
         try (var buffer = new LogMinerTransactionBuffer(type == LogMiningBufferType.MEMORY ? 4096 : 512, 8192, 10, directory, 1048576, 0, type)) {
             buffer.add(row("a", 11, 10, 1, 0, "keep"));
@@ -472,19 +588,43 @@ class LogMinerTransactionBufferTest {
         assertEmptyDirectory();
     }
 
-    @Test
-    void shouldRetainAnEmptyTransactionAfterPartialRollbackUntilItActuallyEnds() {
-        try (var buffer = buffer(512)) {
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldRetainAnEmptyTransactionAfterPartialRollbackUntilItActuallyEnds(LogMiningBufferType type) throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(type == LogMiningBufferType.MEMORY ? 4096 : 512,
+                8192, 10, directory, 1048576, 0, type)) {
             buffer.add(row("a", 10, 10, 6, 1, null));
             buffer.add(row("a", 11, 10, 1, 1, "rolled back"));
-            buffer.add(row("a", 12, 10, 36, 0, null));
+            buffer.add(row("a", 12, 10, 36, 1, null, "9"));
+            buffer.add(row("a", 13, 10, 36, 0, null));
             assertThat(buffer.completeWindow(20)).isEqualTo(10);
             assertThat(buffer.openTransactions()).isEqualTo(1);
             buffer.beginWindow();
             buffer.add(row("a", 21, 0, 1, 0, "later"));
             assertThat(buffer.requiresReconstruction()).isFalse();
             assertThat(buffer.completeWindow(30)).isEqualTo(10);
+            buffer.beginWindow();
+            buffer.add(row("a", 35, 0, 7, 0, null));
+            assertThat(buffer.requiresReconstruction()).isTrue();
+            buffer.resetForReconstruction();
+            buffer.beginWindow();
+            buffer.add(row("a", 10, 10, 6, 1, null));
+            buffer.add(row("a", 11, 10, 1, 1, "rolled back"));
+            buffer.add(row("a", 12, 10, 36, 1, null, "9"));
+            buffer.add(row("a", 13, 10, 36, 0, null));
+            buffer.add(row("a", 21, 10, 1, 0, "later"));
+            buffer.add(row("a", 35, 10, 7, 0, null));
+            final var committed = buffer.committedTransactions();
+            assertThat(committed).hasSize(1);
+            assertThat(read(committed.get(0))).extracting(LogMinerRow::redo).containsExactly("later");
+            buffer.release(committed.get(0));
+            assertThat(buffer.completeWindow(40)).isEqualTo(40);
+            assertThat(buffer.openTransactions()).isZero();
+            assertThat(buffer.bufferedRecords()).isZero();
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.diskBytes()).isZero();
         }
+        assertEmptyDirectory();
     }
 
     @Test
@@ -756,7 +896,11 @@ class LogMinerTransactionBufferTest {
     }
 
     private static LogMinerRow row(String xid, long lsn, long start, int operation, int rollback, String sql) {
-        return new LogMinerRow(lsn, start, 0, xid, operation, rollback, null, null, null, sql, operation == 36 && rollback == 1 ? "-1" : "r", 0, 0,
+        return row(xid, lsn, start, operation, rollback, sql, operation == 36 && rollback == 1 ? "-1" : "r");
+    }
+
+    private static LogMinerRow row(String xid, long lsn, long start, int operation, int rollback, String sql, String recordSetId) {
+        return new LogMinerRow(lsn, start, 0, xid, operation, rollback, null, null, null, sql, recordSetId, 0, 0,
                 Instant.parse("2026-10-16T01:02:03.123456789Z"), 7);
     }
 }
