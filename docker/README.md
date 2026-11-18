@@ -1,6 +1,19 @@
 # Dameng Kafka Connect image
 
-Run `bash docker/build-image.sh --help` from the repository root for build, image export and base-image options. The script resolves the connector version from the standalone POM, builds the plugin, validates the image configuration and optionally exports an archive with a checksum.
+Run `bash docker/build-custom-image.sh --help` from the repository root for build, image export and base-image options. To build from an existing plugin archive:
+
+```bash
+bash docker/build-custom-image.sh \
+  --plugin /path/to/debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible-plugin.tar.gz \
+  --image debezium-connect-dameng:custom \
+  --output /path/to/debezium-connect-dameng-custom.tar.gz
+```
+
+`--plugin` accepts an absolute path or a path relative to your working directory, including files outside the repository. Quote paths containing spaces. This mode does not invoke Java or Maven; do not append Maven options. The archive must contain the plugin directory and its runtime dependencies, as produced by the assembly build. It is copied into a temporary Docker context that is removed when the script exits.
+
+For `debezium-connector-dameng-<version>-plugin.tar.gz`, the default image tag, image version label and export filename use `<version>`, including any compatibility suffix. Other archive names use `custom`. `--image` changes the image name/tag; `--output` independently changes the export path. By default the export is `target/debezium-connect-dameng-<version>-<platform>.tar.gz` with a `.sha256` sidecar. Use `--no-export` to keep only the local image.
+
+Without `--plugin`, the script resolves the connector version from the standalone POM and builds the plugin with Maven. `--skip-build` reuses the local assembly archive but still invokes Maven to resolve its name. Both modes validate the image's environment configuration before exporting it. The Docker daemon is required; uncached base images and a missing JMX agent require downloads.
 
 The image includes JMX Exporter 1.4.0 and the metric mapping, exposing `9404/metrics`. Setting `KAFKA_OPTS` replaces the default; retain the `-javaagent` option when enabling monitoring.
 

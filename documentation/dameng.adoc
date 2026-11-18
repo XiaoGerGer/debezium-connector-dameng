@@ -178,7 +178,8 @@ Keep the default broad schema-history retention to reduce dependence on current 
 
 Build the standalone package as described in link:../README.md[README], extract it into a dedicated worker plugin directory and restart every worker that can run the task.
 Do not mix plugin generations in one directory. The package contains the JDBC driver and runtime dependencies.
-The Docker tooling builds and exports an image; it does not publish or deploy it. Use `bash docker/build-image.sh --help` from the repository root.
+The Docker tooling builds and exports an image; it does not publish or deploy it. Use `bash docker/build-custom-image.sh --help` from the repository root.
+Pass `--plugin /path/to/plugin.tar.gz --image debezium-connect-dameng:custom` to use an existing plugin archive without invoking Java or Maven. Paths outside the repository are supported. See link:../docker/README.md[Docker build options] for tag defaults and export paths.
 Its retained `apache/kafka:3.9.1` base default is not a compatibility certification for the current build; select a runtime validated with your connector artifact.
 Historical Kafka 2.0 instructions in the Chinese manual refer to the original deployment and are not a current standalone support claim.
 

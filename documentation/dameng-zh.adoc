@@ -325,14 +325,29 @@ Oracle 模块的官方镜像配置来自统一镜像项目，本分支达梦的 
 
 === 构建、导出与内网导入
 
-使用根 POM 要求的构建 JDK，在仓库根目录执行：
+使用已有的插件 `tar.gz` 构建自定义镜像，在仓库根目录执行：
 
 [source,shell]
 ----
-bash docker/build-image.sh
+bash docker/build-custom-image.sh \
+  --plugin /path/to/debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible-plugin.tar.gz \
+  --image debezium-connect-dameng:custom \
+  --output /path/to/debezium-connect-dameng-custom.tar.gz
 ----
 
-脚本也可从任意工作目录通过绝对路径调用。它使用 Maven Wrapper 执行 `process-sources install -Passembly -DskipITs`，构建达梦 Connector、assembly 描述符及其依赖，运行单元测试并跳过数据库集成测试。
+`--plugin` 支持仓库外的绝对路径或相对于当前工作目录的路径，含空格时需加引号。压缩包应包含 assembly 产出的插件目录及运行依赖。
+该模式跳过 Java/Maven，不能追加 Maven 参数，无需再加 `--skip-build`。脚本将插件和镜像配置复制到临时构建目录，退出时清理。
+标准文件名 `debezium-connector-dameng-<version>-plugin.tar.gz` 自动提供默认镜像标签、版本标签和导出文件名，其中 `<version>` 包括兼容性后缀；其他文件名使用 `custom`。
+`--image` 覆盖镜像名称和标签，`--output` 独立覆盖导出路径。两种构建方式均需要 Docker；基础镜像未缓存或 JMX Agent 缺失时需要下载。
+
+也可以从源码构建插件。使用根 POM 要求的构建 JDK，在仓库根目录执行：
+
+[source,shell]
+----
+bash docker/build-custom-image.sh
+----
+
+脚本也可从任意工作目录通过绝对路径调用。不传 `--plugin` 时，使用 Maven Wrapper 执行 `process-sources install -Passembly -DskipITs`，构建达梦 Connector、assembly 描述符及其依赖，运行单元测试并跳过数据库集成测试。
 脚本从 Maven 读取项目版本，以 `apache/kafka:3.9.1` 为基础构建 `linux/amd64` 镜像 `debezium-connect-dameng:<version>`，随后运行环境变量回归脚本 `test-env-config.sh`。
 Agent JAR 校验通过时复用，缺失或损坏时调用下载脚本；Docker 构建会再次校验 SHA-256。镜像内置 Agent 和指标映射配置，运行时无需下载或挂载。
 
@@ -341,6 +356,7 @@ Agent JAR 校验通过时复用，缺失或损坏时调用下载脚本；Docker 
 [cols="2,5",options="header"]
 |===
 |选项 |作用
+|`--plugin FILE` |直接使用指定的插件 `.tar.gz` 构建镜像，跳过 Java/Maven。
 |`--image IMAGE` |覆盖镜像名称和标签。
 |`--base-image IMAGE` |覆盖基础镜像。
 |`--platform PLATFORM` |覆盖目标平台。

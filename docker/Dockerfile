@@ -2,11 +2,12 @@ ARG KAFKA_BASE_IMAGE=apache/kafka:3.9.1
 FROM ${KAFKA_BASE_IMAGE}
 
 ARG CONNECTOR_VERSION
+ARG PLUGIN_DISTRIBUTION_NAME=debezium-connector-dameng-${CONNECTOR_VERSION}
 LABEL org.opencontainers.image.title="Debezium Connect with Dameng connector" \
     org.opencontainers.image.version="${CONNECTOR_VERSION}"
 
 USER root
-COPY target/debezium-connector-dameng-${CONNECTOR_VERSION}-plugin.tar.gz /tmp/dameng-plugin.tar.gz
+COPY target/${PLUGIN_DISTRIBUTION_NAME}-plugin.tar.gz /tmp/dameng-plugin.tar.gz
 COPY docker/connect-distributed.properties /etc/kafka/connect-distributed.properties
 COPY docker/configure-connect.sh docker/run-connect.sh /opt/kafka/bin/
 COPY docker/monitoring/agent/jmx_prometheus_javaagent-1.4.0.jar /opt/jmx/jmx_prometheus_javaagent-1.4.0.jar

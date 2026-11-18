@@ -28,7 +28,7 @@ python3 .github/scripts/verify-plugin.py \
   --distribution-name debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible
 ```
 
-This profile aligns the Kafka dependencies to `3.9.1` and produces `target/debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible-plugin.zip` and `.tar.gz`. It keeps the pinned Debezium version and the normal build's Kafka target. Use a worker JVM that can run Java 17 bytecode; the packaged regression uses Java 21. See [test instructions](src/test/README.md) for actual worker verification.
+This profile aligns the Kafka dependencies to `3.9.1` and produces `target/debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible-plugin.zip` and `.tar.gz`. It keeps the pinned Debezium version and the normal build's Kafka target. Use a worker JVM that can run Java 17 bytecode; the packaged regression uses Java 21. See [test instructions](src/test/README.md) for actual worker verification. To build the Docker image with the same profile, use `bash docker/build-custom-image.sh -- -Passembly,kafka2-compatible`.
 
 ## Database tests
 
