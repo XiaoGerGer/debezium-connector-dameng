@@ -14,7 +14,9 @@ Use JDK 21 or newer and the included Maven wrapper. Java 17 is the bytecode targ
 ./mvnw clean verify -Passembly
 ```
 
-The first command clones the pinned upstream revision into a new directory, or checks an existing clean checkout at that revision. It builds the required framework, test and build-tool artifacts. It does not build another connector or a shared DDL parser. Pass the same `-Dmaven.repo.local=/path/to/cache` to both the bootstrap script and connector commands to use a separate Maven repository.
+The first command clones the pinned upstream revision into a new directory, or checks an existing clean checkout at that revision. It builds the required framework, public DDL parser, test and build-tool artifacts. It does not build another connector. Pass the same `-Dmaven.repo.local=/path/to/cache` to both the bootstrap script and connector commands to use a separate Maven repository.
+
+Dameng generates its grammar locally and uses Debezium's `AntlrDdlParser` to execute model parsing and report `DdlChanges`. Scope analysis, database-specific type semantics and original SQL positions remain in the connector. Model changes are staged until parsing succeeds, and streaming retains each statement's table image. Schema history continues to recover from structured table changes. The plugin distribution includes the matching public `debezium-ddl-parser` dependency.
 
 Unit and architecture tests run without a database. Integration tests are opt-in. Plugin archives are written to `target/debezium-connector-dameng-<version>-plugin.zip` and `.tar.gz`. Extract one archive into a dedicated directory on the Kafka Connect worker's `plugin.path`, then restart the worker. The archive contains the connector, its runtime dependencies and the JDBC driver; Kafka Connect and its APIs come from the worker.
 

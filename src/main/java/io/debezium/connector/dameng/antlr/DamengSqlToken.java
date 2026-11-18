@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.dameng.antlr;
 
+import io.debezium.text.Position;
+
 /** SQL token with its original spelling and UTF-16 source locations. */
 public record DamengSqlToken(Kind kind, String text, int start, int end, String source) {
     public enum Kind {
@@ -88,6 +90,22 @@ public record DamengSqlToken(Kind kind, String text, int start, int end, String 
                 column++;
             }
         }
-        return new IllegalArgumentException(message + " at character " + offset + " (line " + line + ", column " + column + ")");
+        return new ParsingFailure(new Position(offset, line, column),
+                message + " at character " + offset + " (line " + line + ", column " + column + ")");
+    }
+
+    /** Keeps the existing SQL exception contract while exposing positions to the public parser. */
+    static final class ParsingFailure extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+        private final Position position;
+
+        private ParsingFailure(Position position, String message) {
+            super(message);
+            this.position = position;
+        }
+
+        Position position() {
+            return position;
+        }
     }
 }

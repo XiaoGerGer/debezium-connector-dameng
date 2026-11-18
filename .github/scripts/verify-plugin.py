@@ -24,8 +24,21 @@ with zipfile.ZipFile(root / "target" / f"{stem}-plugin.zip") as archive:
     jar_names = [Path(name).name for name in files if name.endswith(".jar")]
     assert any(name.startswith("DmJdbcDriver18-") for name in jar_names), "Missing JDBC driver"
     assert any(name.startswith("antlr4-runtime-") for name in jar_names), "Missing ANTLR runtime"
-    forbidden = ("debezium-ddl-parser-", "connect-api-", "connect-runtime-", "kafka-clients-", "slf4j-api-")
+    assert f"debezium-ddl-parser-{version}.jar" in jar_names, "Missing aligned public DDL parser"
+    forbidden = ("connect-api-", "connect-runtime-", "kafka-clients-", "slf4j-api-")
     assert not any(name.startswith(forbidden) or name.endswith("-tests.jar") for name in jar_names), jar_names
+    parser_owners = {name: [] for name in (
+        "io/debezium/antlr/AntlrDdlParser.class",
+        "io/debezium/ddl/parser/dameng/generated/DamengSqlParser.class",
+    )}
+    for name in files:
+        if name.endswith(".jar"):
+            with zipfile.ZipFile(io.BytesIO(archive.read(name))) as dependency:
+                for parser_class, owners in parser_owners.items():
+                    if parser_class in dependency.namelist():
+                        owners.append(Path(name).name)
+    assert parser_owners["io/debezium/antlr/AntlrDdlParser.class"] == [f"debezium-ddl-parser-{version}.jar"], parser_owners
+    assert parser_owners["io/debezium/ddl/parser/dameng/generated/DamengSqlParser.class"] == [f"{stem}.jar"], parser_owners
     with zipfile.ZipFile(io.BytesIO(jar_bytes)) as jar:
         assert "io/debezium/ddl/parser/dameng/generated/DamengSqlParser.class" in jar.namelist()
         assert jar.read("io/debezium/connector/dameng/build.version").decode().strip() == f"version={version}"

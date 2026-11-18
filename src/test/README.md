@@ -43,6 +43,8 @@ Surefire writes unit reports under `target/surefire-reports`; Failsafe writes in
 
 The 95% line coverage gate measures handwritten production classes. Locally generated ANTLR classes under `io/debezium/ddl/parser/dameng/generated` are excluded from the report and gate; the handwritten `DamengSqlLexerBase` remains included.
 
+`DamengPublicDdlParserTest` exercises the standard Debezium `DdlParser` interface: ordered change events, atomic model updates, parser reuse after failure, structured error positions, original quoted defaults, and selected-token planning. Run it with `./mvnw process-sources test -Dtest=DamengPublicDdlParserTest`. Existing DDL, scope and compatibility tests also exercise the public parse lifecycle through the connector entry points. `DamengAntlrStreamingIT` verifies DDL replay and schema recovery against a real database; packaged Connect tests verify that the public parser dependency is available in the deployed plugin.
+
 See the [Dameng manual](../../documentation/dameng.adoc#dameng-testing) for images, offline preparation and coverage checks. [testing.adoc](testing.adoc) contains the applicability matrix and performance properties; [regression-history.adoc](regression-history.adoc) preserves dated execution records.
 
 ## Standalone migration regression

@@ -141,11 +141,10 @@ public final class DamengDdlStatementAnalyzer {
     }
 
     /** Parses complete scripts, including stored program bodies, before planning any historical changes. */
-    public List<Analysis> analyzeScript(String sql, String defaultSchema) {
-        final var parsed = DamengParseTree.parseScript(sql, nestedComments);
+    List<Analysis> analyzeScript(Parsed<DamengSqlParser.DdlScriptContext> parsed, String defaultSchema) {
         final List<Analysis> result = new ArrayList<>();
         for (var script : parsed.tree().scriptStatement()) {
-            result.add(analyzeStatement(sql, script.statement(), defaultSchema));
+            result.add(analyzeStatement(parsed.sql(), script.statement(), defaultSchema));
         }
         return List.copyOf(result);
     }

@@ -17,6 +17,7 @@ import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonToken;
 import org.antlr.v4.runtime.RecognitionException;
 import org.antlr.v4.runtime.Recognizer;
+import org.antlr.v4.runtime.Token;
 
 import io.debezium.connector.dameng.antlr.DamengSqlToken.Kind;
 
@@ -37,6 +38,18 @@ public final class DamengAntlrSqlLexer {
     }
 
     static Lexed lex(String input, boolean nestedComments) {
+        final var lexer = lexer(input, nestedComments);
+        final List<Token> tokens = new ArrayList<>();
+        for (var token = lexer.nextToken();; token = lexer.nextToken()) {
+            tokens.add(token);
+            if (token.getType() == Token.EOF) {
+                break;
+            }
+        }
+        return adapt(input, tokens);
+    }
+
+    static io.debezium.ddl.parser.dameng.generated.DamengSqlLexer lexer(String input, boolean nestedComments) {
         Objects.requireNonNull(input, "SQL");
         final var offsets = utf16Offsets(input);
         final var lexer = new io.debezium.ddl.parser.dameng.generated.DamengSqlLexer(CharStreams.fromString(input));
@@ -49,10 +62,14 @@ public final class DamengAntlrSqlLexer {
                 throw DamengSqlToken.error(input, offsets[lexer._tokenStartCharIndex], message);
             }
         });
+        return lexer;
+    }
 
+    static Lexed adapt(String input, List<Token> tokens) {
+        final var offsets = utf16Offsets(input);
         final List<DamengSqlToken> result = new ArrayList<>();
         final List<CommonToken> parserTokens = new ArrayList<>();
-        for (var token = lexer.nextToken();; token = lexer.nextToken()) {
+        for (var token : tokens) {
             final var adapted = new CommonToken(token.getType(), token.getText());
             adapted.setLine(token.getLine());
             adapted.setCharPositionInLine(token.getCharPositionInLine());

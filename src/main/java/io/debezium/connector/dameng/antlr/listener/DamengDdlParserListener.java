@@ -11,7 +11,6 @@ import java.util.List;
 import java.util.Objects;
 
 import org.antlr.v4.runtime.ParserRuleContext;
-import org.antlr.v4.runtime.tree.ParseTreeWalker;
 
 import io.debezium.connector.dameng.antlr.DamengDdlParser.SchemaChange;
 import io.debezium.connector.dameng.antlr.DamengDdlStatementAnalyzer.Analysis;
@@ -38,8 +37,7 @@ public final class DamengDdlParserListener extends DamengSqlParserBaseListener {
         this.listeners = List.of(new CreateTableParserListener(this), new AlterTableParserListener(this), new TableLifecycleParserListener(this));
     }
 
-    public SchemaChange walk() {
-        ParseTreeWalker.DEFAULT.walk(this, analysis.tableStatement());
+    public SchemaChange change() {
         return Objects.requireNonNull(change, "A table statement must produce a historical schema change");
     }
 

@@ -31,16 +31,15 @@ public final class DamengParseTree {
         return parseScope(sql, DamengAntlrSqlLexer.lex(sql, nestedComments));
     }
 
-    public static Parsed<DamengSqlParser.DdlScriptContext> parseScript(String sql, boolean nestedComments) {
-        final var lexed = DamengAntlrSqlLexer.lex(sql, nestedComments);
-        return new Parsed<>(sql, lexed.tokens(), parser(sql, lexed).ddlScript());
-    }
-
     static Parsed<DamengSqlParser.DdlScopeContext> parseScope(String sql, DamengAntlrSqlLexer.Lexed lexed) {
         return new Parsed<>(sql, lexed.tokens(), parser(sql, lexed).ddlScope());
     }
 
     static Parsed<DamengSqlParser.DdlScopeContext> parseTokens(String sql, List<DamengSqlToken> tokens) {
+        return parseScope(sql, selectedTokens(sql, tokens));
+    }
+
+    static DamengAntlrSqlLexer.Lexed selectedTokens(String sql, List<DamengSqlToken> tokens) {
         final List<CommonToken> adapted = new ArrayList<>(tokens.size() + 1);
         for (var token : tokens) {
             final int type = switch (token.kind()) {
@@ -61,7 +60,7 @@ public final class DamengParseTree {
         eof.setStartIndex(end);
         eof.setStopIndex(end - 1);
         adapted.add(eof);
-        return parseScope(sql, new DamengAntlrSqlLexer.Lexed(tokens, adapted));
+        return new DamengAntlrSqlLexer.Lexed(tokens, adapted);
     }
 
     public static String source(ParserRuleContext context) {
@@ -104,7 +103,7 @@ public final class DamengParseTree {
         return result.toString();
     }
 
-    private static DamengSqlParser parser(String sql, DamengAntlrSqlLexer.Lexed lexed) {
+    static DamengSqlParser parser(String sql, DamengAntlrSqlLexer.Lexed lexed) {
         final var input = new Input(sql, lexed.tokens());
         final List<org.antlr.v4.runtime.Token> tokens = new ArrayList<>(lexed.parserTokens().size());
         for (var token : lexed.parserTokens()) {

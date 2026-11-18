@@ -18,6 +18,6 @@ fi
 [[ -z "$(git -C "$core_dir" status --porcelain)" ]] || { echo 'Core checkout must be unmodified' >&2; exit 1; }
 cd -- "$core_dir"
 ./mvnw -B -ntp \
-    -pl debezium-bom,debezium-connector-common,debezium-util,debezium-config,debezium-embedded,debezium-storage/debezium-storage-kafka,debezium-storage/debezium-storage-file,debezium-connect-plugins,debezium-schema-generator,support/archunit,support/ide-configs,support/checkstyle,support/revapi \
+    -pl debezium-bom,debezium-connector-common,debezium-ddl-parser,debezium-util,debezium-config,debezium-embedded,debezium-storage/debezium-storage-kafka,debezium-storage/debezium-storage-file,debezium-connect-plugins,debezium-schema-generator,support/archunit,support/ide-configs,support/checkstyle,support/revapi \
     -am process-sources install -DskipTests -DskipITs -Darchunit.skip=true \
     -Dformat.formatter.goal=validate -Dformat.imports.goal=check "$@"
