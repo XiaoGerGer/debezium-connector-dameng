@@ -20,6 +20,16 @@ Dameng generates its grammar locally and uses Debezium's `AntlrDdlParser` to exe
 
 Unit and architecture tests run without a database. Integration tests are opt-in. Plugin archives are written to `target/debezium-connector-dameng-<version>-plugin.zip` and `.tar.gz`. Extract one archive into a dedicated directory on the Kafka Connect worker's `plugin.path`, then restart the worker. The archive contains the connector, its runtime dependencies and the JDBC driver; Kafka Connect and its APIs come from the worker.
 
+To build for Kafka Connect worker **3.9.1**, enable the `kafka2-compatible` profile:
+
+```sh
+./mvnw clean package -Passembly,kafka2-compatible
+python3 .github/scripts/verify-plugin.py \
+  --distribution-name debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible
+```
+
+This profile aligns the Kafka dependencies to `3.9.1` and produces `target/debezium-connector-dameng-3.8.0-SNAPSHOT-kafka2-compatible-plugin.zip` and `.tar.gz`. It keeps the pinned Debezium version and the normal build's Kafka target. Use a worker JVM that can run Java 17 bytecode; the packaged regression uses Java 21. See [test instructions](src/test/README.md) for actual worker verification.
+
 ## Database tests
 
 Tests use disposable Testcontainers databases. Obtain the DM installation image from the vendor under its applicable terms and load it locally. The default fixture uses this archive and tag:

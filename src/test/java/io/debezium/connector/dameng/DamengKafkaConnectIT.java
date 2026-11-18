@@ -340,6 +340,11 @@ class DamengKafkaConnectIT {
     }
 
     private void assertPluginIsLoaded(DamengKafkaConnectEnvironment environment) throws Exception {
+        final var worker = request(environment, "GET", "/", null);
+        assertThat(worker.statusCode()).isEqualTo(200);
+        assertThat(JSON.readTree(worker.body()).path("version").asText())
+                .as("the packaged regression runs the selected Kafka Connect worker version")
+                .isEqualTo(System.getProperty("dameng.connect.kafka.version"));
         final var response = request(environment, "GET", "/connector-plugins", null);
         assertThat(response.statusCode()).isEqualTo(200);
         final var plugins = JSON.readTree(response.body());

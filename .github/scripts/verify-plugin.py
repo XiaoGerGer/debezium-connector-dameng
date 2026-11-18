@@ -3,6 +3,7 @@
 # Licensed under the Apache Software License, Version 2.0.
 """Check the distributable plugin rather than the Maven test classpath."""
 
+import argparse
 import io
 from pathlib import Path
 import tarfile
@@ -15,7 +16,10 @@ pom = ET.parse(root / "pom.xml").getroot()
 artifact = pom.findtext("m:artifactId", namespaces=ns)
 version = pom.findtext("m:version", namespaces=ns)
 stem = f"{artifact}-{version}"
-with zipfile.ZipFile(root / "target" / f"{stem}-plugin.zip") as archive:
+arguments = argparse.ArgumentParser(description=__doc__)
+arguments.add_argument("--distribution-name", default=stem, help="Assembly filename before -plugin.zip / -plugin.tar.gz")
+distribution = arguments.parse_args().distribution_name
+with zipfile.ZipFile(root / "target" / f"{distribution}-plugin.zip") as archive:
     files = {name for name in archive.namelist() if not name.endswith("/")}
     for notice in ("LICENSE", "README.md"):
         assert archive.read(f"{artifact}/{notice}") == (root / notice).read_bytes(), notice
@@ -51,6 +55,6 @@ with zipfile.ZipFile(root / "target" / f"{stem}-plugin.zip") as archive:
             "io.debezium.snapshot.spi.SnapshotQuery",
         ):
             assert jar.read(f"META-INF/services/{service}").strip(), service
-    with tarfile.open(root / "target" / f"{stem}-plugin.tar.gz") as tar:
+    with tarfile.open(root / "target" / f"{distribution}-plugin.tar.gz") as tar:
         assert files == {entry.name for entry in tar if entry.isfile()}, "ZIP/tar file sets differ"
-print(f"Verified {stem}: notices, driver/runtime, generated parser, SPI, descriptor and archive contents")
+print(f"Verified {distribution}: notices, driver/runtime, generated parser, SPI, descriptor and archive contents")

@@ -330,7 +330,8 @@ final class DamengKafkaConnectEnvironment implements AutoCloseable {
 
     private void extractCurrentPlugin() throws Exception {
         final String stem = "debezium-connector-dameng-" + Module.version();
-        final Path archive = buildDirectory.resolve(stem + "-plugin.zip");
+        final String distribution = System.getProperty("dameng.distribution.name", stem);
+        final Path archive = buildDirectory.resolve(distribution + "-plugin.zip");
         final Path moduleJar = buildDirectory.resolve(stem + ".jar");
         assertThat(archive).as("Build the current plugin with -Pdameng-connect-tests,assembly").exists();
         Path packagedModule = null;

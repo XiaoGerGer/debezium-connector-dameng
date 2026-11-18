@@ -28,6 +28,17 @@ Database tests require Docker and the documented DM image. They create and clean
 
 The Connect test profile assembles the Kafka runtime resolved by the pinned Debezium parent. It aligns Jetty to `12.1.11` with the Jetty and EE10 BOMs because this parent manages only the servlet artifact at that version, while Kafka `4.3.1` requests `12.0.34` for the other Jetty components. Keep this test-only alignment consistent when updating the parent. Jetty is not part of the connector plugin archives.
 
+Add `kafka2-compatible` to verify the packaged connector with Kafka Connect worker `3.9.1`:
+
+```sh
+./mvnw clean verify -Pdameng-connect-tests,assembly,kafka2-compatible \
+  -Dit.test=DamengKafkaConnectIT
+```
+
+The compatibility profile overrides Kafka dependencies and uses Kafka 3.9.1's Jetty `9.4.57.v20241219` for the assembled runtime. It also manages Commons IO at `2.20.0` so Testcontainers' Commons Compress can copy files into containers despite the older broker dependency. The tests select the archive with the `-kafka2-compatible` suffix and check the worker's version through REST before checking plugin discovery. Docker and the prepared DM image are required. The worker JVM defaults to Java 21; set `-Ddameng.connect.java.image=<image:tag>` for another compatible Java image.
+
+On 2026-11-18, the compatibility package passed 14,362 unit cases and 2 architecture checks. All 3 `DamengKafkaConnectIT` cases passed on the Maven-assembled Kafka `3.9.1` runtime, Java 21 and DM `8.1.3.162`: snapshot/CRUD with task and worker recovery, all 3,000 rows after a worker kill during transaction publication, and typed CRUD through a broker outage and worker reassignment. These results cover the assembled runtime; an unmodified Kafka distribution image was not tested in this run.
+
 Run one diagnostic explicitly, for example:
 
 ```sh
