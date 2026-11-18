@@ -31,10 +31,15 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     private final long maxSqlBytes;
     private final long maxTransactions;
     private final LogMinerSpillStore store;
+    // Buckets contain only nonempty resident transactions. The fixed control array
+    // is separate from the per-transaction metadata estimate, as are store buffers.
+    private final Transaction[] spillBuckets;
+    private long nonemptySpillBuckets;
     private final long baselineLsn;
     private long memoryBytes;
     private long bufferedRecords;
     private long spilledTransactions;
+    private long openTransactions;
     private long windowBytes;
     private long windowRecords;
     private IllegalStateException capacityFailure;
@@ -65,6 +70,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         this.maxTransactions = maxTransactions;
         this.baselineLsn = baselineLsn;
         store = Objects.requireNonNull(bufferType) == LogMiningBufferType.HYBRID ? new LogMinerSpillStore(spillPath, spillLimit) : null;
+        spillBuckets = store == null ? null : new Transaction[Long.SIZE - 1];
     }
 
     public void beginWindow() {
@@ -186,7 +192,8 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             if (transactions.size() >= maxTransactions) {
                 throw capacityFailure("Dameng resident transaction count exceeds log.mining.buffer.max.transactions=" + maxTransactions);
             }
-            final long metadata = 256L + 2L * row.transactionId().length();
+            // Include 32 estimated bytes for the two eviction links and bucket index.
+            final long metadata = 288L + 2L * row.transactionId().length();
             makeRoom(metadata);
             if (metadata > memoryLimit - memoryBytes) {
                 throw capacityFailure("Dameng pending transaction metadata exceeds log.mining.buffer.memory.bytes=" + memoryLimit);
@@ -194,7 +201,9 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             tx = new Transaction(row, metadata);
             transactions.put(tx.id, tx);
             memoryBytes += metadata;
+            openTransactions++;
         }
+        final boolean wasOpen = tx.isOpen();
         if (tx.carried && (eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT || eventType == EventType.ROLLBACK || row.rollback() != 0)) {
             reconstructionRequired = true;
         }
@@ -203,9 +212,6 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         switch (eventType) {
             case COMMIT, XA_COMMIT -> {
                 tx.commitLsn = row.lsn();
-                if (dispatchProgress != null && dispatchProgress.canDiscard(tx.commitLsn, tx.id)) {
-                    release(tx);
-                }
             }
             case ROLLBACK -> {
                 // Tested DM versions identify terminal full rollback with operation
@@ -223,14 +229,17 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             default -> {
                 if (row.rollback() == 0) {
                     final long bytes = estimatedBytes(row);
-                    makeRoom(bytes);
-                    if (tx.file == null && bytes > memoryLimit - memoryBytes) {
-                        spill(tx);
+                    if (tx.file == null) {
+                        makeRoom(bytes);
+                        if (tx.file == null && bytes > memoryLimit - memoryBytes) {
+                            spill(tx);
+                        }
                     }
                     if (tx.file == null) {
                         tx.rows.add(row);
                         tx.memoryBytes += bytes;
                         memoryBytes += bytes;
+                        updateSpillCandidate(tx);
                     }
                     else {
                         append(tx, row);
@@ -239,6 +248,15 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
                     bufferedRecords++;
                 }
             }
+        }
+        // Completion can change in either direction with a later nonterminal
+        // rollback marker. Event-name increments are insufficient.
+        if (wasOpen != tx.isOpen()) {
+            openTransactions += wasOpen ? -1 : 1;
+        }
+        if ((eventType == EventType.COMMIT || eventType == EventType.XA_COMMIT) && dispatchProgress != null
+                && dispatchProgress.canDiscard(tx.commitLsn, tx.id)) {
+            release(tx);
         }
     }
 
@@ -273,13 +291,53 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
             return;
         }
         while (bytes > memoryLimit - memoryBytes) {
-            final var largest = transactions.values().stream().filter(tx -> !tx.rows.isEmpty())
-                    .max(Comparator.comparingLong(tx -> tx.memoryBytes)).orElse(null);
-            if (largest == null) {
+            if (nonemptySpillBuckets == 0) {
                 break;
             }
-            spill(largest);
+            // All members of the largest occupied power-of-two bucket are within
+            // a factor of two of the largest resident transaction. No map scan.
+            spill(spillBuckets[Long.SIZE - 1 - Long.numberOfLeadingZeros(nonemptySpillBuckets)]);
         }
+    }
+
+    private void updateSpillCandidate(Transaction tx) {
+        if (spillBuckets == null) {
+            return;
+        }
+        final int bucket = Long.SIZE - 1 - Long.numberOfLeadingZeros(tx.memoryBytes);
+        if (bucket == tx.spillBucket) {
+            return;
+        }
+        removeSpillCandidate(tx);
+        tx.spillBucket = bucket;
+        tx.nextSpill = spillBuckets[bucket];
+        if (tx.nextSpill != null) {
+            tx.nextSpill.previousSpill = tx;
+        }
+        spillBuckets[bucket] = tx;
+        nonemptySpillBuckets |= 1L << bucket;
+    }
+
+    private void removeSpillCandidate(Transaction tx) {
+        final int bucket = tx.spillBucket;
+        if (bucket < 0) {
+            return;
+        }
+        if (tx.previousSpill == null) {
+            spillBuckets[bucket] = tx.nextSpill;
+        }
+        else {
+            tx.previousSpill.nextSpill = tx.nextSpill;
+        }
+        if (tx.nextSpill != null) {
+            tx.nextSpill.previousSpill = tx.previousSpill;
+        }
+        if (spillBuckets[bucket] == null) {
+            nonemptySpillBuckets &= ~(1L << bucket);
+        }
+        tx.previousSpill = null;
+        tx.nextSpill = null;
+        tx.spillBucket = -1;
     }
 
     private void spill(Transaction tx) {
@@ -287,6 +345,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         for (var row : tx.rows) {
             append(tx, row);
         }
+        removeSpillCandidate(tx);
         memoryBytes -= tx.memoryBytes;
         tx.memoryBytes = 0;
         tx.rows.clear();
@@ -323,6 +382,10 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         if (tx.file != null) {
             store.delete(tx.file, tx.diskBytes);
         }
+        removeSpillCandidate(tx);
+        if (tx.isOpen()) {
+            openTransactions--;
+        }
         memoryBytes -= tx.memoryBytes + tx.metadataBytes;
         bufferedRecords -= tx.recordCount;
         transactions.remove(tx.id);
@@ -356,7 +419,7 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
     }
 
     public long openTransactions() {
-        return transactions.values().stream().filter(tx -> tx.commitLsn == 0 && !tx.isFullyRolledBack()).count();
+        return openTransactions;
     }
 
     public long windowBytes() {
@@ -393,6 +456,11 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         }
         finally {
             transactions.clear();
+            if (spillBuckets != null) {
+                java.util.Arrays.fill(spillBuckets, null);
+            }
+            nonemptySpillBuckets = 0;
+            openTransactions = 0;
             memoryBytes = 0;
             bufferedRecords = 0;
             fragment = null;
@@ -428,6 +496,9 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         private long diskBytes;
         private long recordCount;
         private long maxFrameBytes;
+        private Transaction previousSpill;
+        private Transaction nextSpill;
+        private int spillBucket = -1;
 
         private Transaction(LogMinerRow row, long metadataBytes) {
             id = row.transactionId();
@@ -442,6 +513,10 @@ public final class LogMinerTransactionBuffer implements AutoCloseable {
         private boolean isFullyRolledBack() {
             // Full rollback discards all buffered data, including provisional rows.
             return commitLsn == 0 && fullRollbackMarker;
+        }
+
+        private boolean isOpen() {
+            return commitLsn == 0 && !isFullyRolledBack();
         }
 
         public long commitLsn() {

@@ -52,6 +52,23 @@ Select a complete nested suite with `-Dit.test=DamengConnectorIT`. Run method-fi
 
 Surefire writes unit reports under `target/surefire-reports`; Failsafe writes integration reports under `target/failsafe-reports`. Use a clean run when collecting coverage with `dameng-coverage` so previous JaCoCo data is not included. A targeted run does not establish complete regression coverage.
 
+### Transaction cache algorithm benchmark
+
+`LogMinerTransactionBufferBenchmark` is an opt-in standalone program using real temporary spill files, with no database or Kafka connection. Compile test sources and resolve the test classpath, then run it with the same JDK:
+
+```sh
+./mvnw test-compile dependency:build-classpath -Dmdep.outputFile=target/buffer-benchmark-classpath.txt
+java -Xms512m -Xmx512m -XX:+UseG1GC \
+  -cp "target/classes:target/test-classes:$(cat target/buffer-benchmark-classpath.txt)" \
+  io.debezium.connector.dameng.logminer.LogMinerTransactionBufferBenchmark memory 100000 1 3
+```
+
+Arguments are scenario, transaction count, warmup iterations and measured iterations. Scenarios: `memory` (many transactions with metrics sampled every 1,024 input rows), `hybrid-small` (many small transactions), `hybrid-skewed` (small and large transactions), and `spilled-append` (append to an already-spilled transaction while others remain resident). Suggested hybrid counts are 20,000, 20,000 and 2,000 respectively.
+
+CSV output separates add/metrics, read/release and close time, and reports spill count, estimated resident bytes, logical disk bytes, thread-allocated bytes, delivered row count and checksum. All input rows are prepared outside the timed phase; every delivered row and its order are checked, and storage must be empty afterward. Logging is disabled equally for all scenarios. Resident bytes are the connector estimate, and allocated bytes measure allocation volume rather than retained JVM heap. Use repeated JVMs with alternating baseline/new order and identical heap/filesystem settings for comparisons. Check whether the temporary directory is tmpfs; use `-Djava.io.tmpdir=<existing disk-backed directory>` to measure file I/O on disk. Writes use the existing buffered spill implementation without fsync. These measurements do not include JDBC mining or establish the cause of a production stall.
+
+The size-bucket eviction index adds 32 estimated metadata bytes per retained transaction, including in `memory` mode. Its fixed hybrid bucket array is control overhead outside the resident payload estimate. Hybrid still uses one file per spilled transaction; this optimization does not change the on-disk layout or eliminate small files.
+
 The 95% line coverage gate measures handwritten production classes. Locally generated ANTLR classes under `io/debezium/ddl/parser/dameng/generated` are excluded from the report and gate; the handwritten `DamengSqlLexerBase` remains included.
 
 `DamengPublicDdlParserTest` exercises the standard Debezium `DdlParser` interface: ordered change events, atomic model updates, parser reuse after failure, structured error positions, original quoted defaults, and selected-token planning. Run it with `./mvnw process-sources test -Dtest=DamengPublicDdlParserTest`. Existing DDL, scope and compatibility tests also exercise the public parse lifecycle through the connector entry points. `DamengAntlrStreamingIT` verifies DDL replay and schema recovery against a real database; packaged Connect tests verify that the public parser dependency is available in the deployed plugin.

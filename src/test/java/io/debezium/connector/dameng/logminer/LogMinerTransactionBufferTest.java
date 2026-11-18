@@ -32,14 +32,14 @@ class LogMinerTransactionBufferTest {
     @Test
     void shouldRetainAndReleaseExactlyTheMemoryBudgetWithoutCreatingSpillStorage() throws Exception {
         final var unusedPath = directory.resolve("unused");
-        // XID "a" metadata: 258 bytes; one row with XID "a", SQL "x", RS_ID "r": 510 bytes.
-        try (var buffer = new LogMinerTransactionBuffer(768, 8192, 10, unusedPath, 1, 0, LogMiningBufferType.MEMORY)) {
+        // XID "a" metadata: 290 bytes, including eviction links; row with SQL "x", RS_ID "r": 510 bytes.
+        try (var buffer = new LogMinerTransactionBuffer(800, 8192, 10, unusedPath, 1, 0, LogMiningBufferType.MEMORY)) {
             buffer.beginWindow();
             buffer.add(row("a", 11, 10, 1, 0, "x"));
             buffer.add(row("a", 12, 10, 7, 0, null));
             buffer.finishWindow();
 
-            assertThat(buffer.memoryBytes()).isEqualTo(768);
+            assertThat(buffer.memoryBytes()).isEqualTo(800);
             assertThat(buffer.diskBytes()).isZero();
             assertThat(buffer.spilledTransactions()).isZero();
             assertThat(Files.exists(unusedPath)).isFalse();
@@ -57,7 +57,7 @@ class LogMinerTransactionBufferTest {
     @ParameterizedTest
     @ValueSource(booleans = { false, true })
     void shouldPoisonMemoryOnlyBufferOnRowOrMetadataOverflow(boolean metadata) throws Exception {
-        final long memory = metadata ? 257 : 768;
+        final long memory = metadata ? 289 : 800;
         try (var buffer = new LogMinerTransactionBuffer(memory, 8192, 10, directory, 1, 0, LogMiningBufferType.MEMORY)) {
             if (!metadata) {
                 buffer.add(row("a", 11, 10, 1, 0, "x"));
@@ -873,6 +873,107 @@ class LogMinerTransactionBufferTest {
         limits[index] = 0;
         assertThatThrownBy(() -> new LogMinerTransactionBuffer(limits[0], limits[1], limits[2], directory, limits[3]))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void shouldAppendSpilledRowsWithoutEvictingResidentTransactions() throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(4096, 8192, 10, directory, 1048576)) {
+            final var first = row("a", 11, 10, 1, 0, "a".repeat(2048));
+            final var resident = row("b", 12, 10, 1, 0, "b".repeat(512));
+            final var second = row("a", 13, 10, 1, 0, "c".repeat(2048));
+            buffer.add(first);
+            buffer.add(resident);
+            assertThat(buffer.spilledTransactions()).isEqualTo(1);
+            final long memory = buffer.memoryBytes();
+            buffer.add(second);
+            assertThat(buffer.spilledTransactions()).isEqualTo(1);
+            assertThat(buffer.memoryBytes()).isEqualTo(memory);
+            buffer.add(row("a", 14, 10, 7, 0, null));
+            buffer.add(row("b", 15, 10, 7, 0, null));
+            final var committed = buffer.committedTransactions();
+            assertThat(read(committed.get(0))).containsExactly(first, second);
+            assertThat(read(committed.get(1))).containsExactly(resident);
+            committed.forEach(buffer::release);
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.diskBytes()).isZero();
+        }
+        assertEmptyDirectory();
+    }
+
+    @ParameterizedTest
+    @EnumSource(LogMiningBufferType.class)
+    void shouldCountOnlyOpenTransactionsThroughStateChangesAndReplayDiscard(LogMiningBufferType type) {
+        try (var buffer = new LogMinerTransactionBuffer(16384, 8192, 10, directory, 1048576, 0, type)) {
+            buffer.beginWindow(new DispatchProgress(100, null));
+            buffer.add(row("a", 10, 10, 6, 0, null));
+            buffer.add(row("b", 11, 11, 6, 1, null));
+            assertThat(buffer.openTransactions()).isEqualTo(2);
+            buffer.add(row("b", 12, 11, 36, 0, null)); // Savepoint rollback is not terminal.
+            assertThat(buffer.openTransactions()).isEqualTo(2);
+            buffer.add(row("b", 13, 11, 36, 1, null));
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+            buffer.add(row("b", 14, 11, 36, 1, null)); // Repeated marker must not decrement twice.
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+            buffer.add(row("b", 15, 11, 36, 0, null)); // Unknown/nonterminal marker restores pending state.
+            assertThat(buffer.openTransactions()).isEqualTo(2);
+            buffer.add(row("b", 16, 11, 1, 0, "provisional"));
+            assertThat(buffer.openTransactions()).isEqualTo(2);
+            buffer.add(row("b", 17, 11, 36, 1, null)); // Full rollback completes even a nonempty cache.
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+            buffer.add(row("a", 20, 10, 7, 0, null)); // Previously dispatched: release at COMMIT.
+            assertThat(buffer.openTransactions()).isZero();
+            buffer.add(row("b", 101, 11, 7, 0, null));
+            buffer.add(row("b", 101, 11, 7, 0, null));
+            assertThat(buffer.openTransactions()).isZero();
+            buffer.release(buffer.committedTransactions().get(0));
+            assertThat(buffer.openTransactions()).isZero();
+            assertThat(buffer.memoryBytes()).isZero();
+            buffer.add(row("c", 102, 102, 6, 0, null));
+            buffer.add(row("d", 103, 103, 6, 1, null));
+            buffer.add(row("d", 104, 103, 36, 1, null));
+            assertThat(buffer.completeWindow(110)).isEqualTo(102);
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+            buffer.resetForReconstruction();
+            assertThat(buffer.openTransactions()).isZero();
+            buffer.add(row("c", 102, 102, 1, 0, "rebuilt"));
+            assertThat(buffer.openTransactions()).isEqualTo(1);
+            buffer.close();
+            assertThat(buffer.openTransactions()).isZero();
+        }
+    }
+
+    @Test
+    void shouldEvictGrowingLargeTransactionsAndForgetReleasedCandidates() throws Exception {
+        try (var buffer = new LogMinerTransactionBuffer(10000, 8192, 10, directory, 1048576)) {
+            for (String id : List.of("a", "b", "c")) {
+                buffer.add(row(id, 11, 10, 1, 0, "x"));
+            }
+            buffer.add(row("b", 12, 10, 1, 0, "large".repeat(400)));
+            buffer.add(row("d", 13, 10, 1, 0, "large".repeat(400)));
+            assertThat(buffer.spilledTransactions()).isEqualTo(1);
+            for (String id : List.of("a", "c", "b", "d")) {
+                buffer.add(row(id, 20, 10, 7, 0, null));
+                final var tx = buffer.committedTransactions().get(0);
+                assertThat(read(tx)).hasSize(id.equals("b") ? 2 : 1);
+                buffer.release(tx);
+            }
+            assertThat(buffer.memoryBytes()).isZero();
+            assertThat(buffer.diskBytes()).isZero();
+            for (int i = 0; i < 20; i++) {
+                final var value = row("a", 30 + i, 30, 1, 0, "z".repeat(1000));
+                buffer.add(value);
+                buffer.add(row("a", 60 + i, 30, 7, 0, null));
+                final var tx = buffer.committedTransactions().get(0);
+                assertThat(read(tx)).containsExactly(value);
+                buffer.release(tx);
+            }
+            // A stale eviction candidate would create extra files or corrupt the memory accounting.
+            buffer.add(row("e", 100, 100, 1, 0, "large".repeat(800)));
+            buffer.add(row("f", 101, 100, 1, 0, "large".repeat(800)));
+            assertThat(buffer.spilledTransactions()).isEqualTo(2);
+            assertThat(buffer.memoryBytes()).isBetween(1L, 10000L);
+        }
+        assertEmptyDirectory();
     }
 
     private LogMinerTransactionBuffer buffer(long memory) {
