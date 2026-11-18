@@ -17,6 +17,15 @@ Without `--plugin`, the script resolves the connector version from the standalon
 
 The image includes JMX Exporter 1.4.0 and the metric mapping, exposing `9404/metrics`. Setting `KAFKA_OPTS` replaces the default; retain the `-javaagent` option when enabling monitoring.
 
+Set `LOG_LEVEL=DEBUG` to enable global DEBUG logging to the container console, with no logging configuration mount required:
+
+```yaml
+environment:
+  LOG_LEVEL: "DEBUG"
+```
+
+The entrypoint accepts `ALL`, `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL` and `OFF` (case insensitive). Unset or empty values retain the base image's logging defaults. Explicit `KAFKA_LOG4J_OPTS` takes precedence and produces a notice that `LOG_LEVEL` is ignored. This convenience option targets the default Kafka 3.9.1 logging runtime and preserves `KAFKA_OPTS`, including the JMX agent. Rebuild the image to include the updated entrypoint and recreate the container to apply the environment variable; use the Connect logging REST API for changes to a running worker.
+
 See the [connector manual](../documentation/dameng.adoc#dameng-deployment) for deployment, REST configuration and transaction spill storage, and [monitoring](../documentation/dameng.adoc#dameng-monitoring) for Prometheus and Grafana.
 
 The default base is `apache/kafka:3.9.1`, retained from the original deployment tooling. A Dockerfile default is not evidence that the current connector has been validated on that runtime; consult the current build and regression records before deployment, or pass `--base-image` for your validated worker image.

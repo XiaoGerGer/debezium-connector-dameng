@@ -448,11 +448,14 @@ services:
 |`SHUTDOWN_TIMEOUT` |task.shutdown.graceful.timeout.ms。
 |`KAFKA_CONNECT_PLUGINS_DIR` |plugin.path，默认插件位于 /opt/kafka/plugins。
 |`HEAP_OPTS`、`KAFKA_HEAP_OPTS` |Worker JVM 堆选项，镜像默认 -Xms4G -Xmx4G；HEAP_OPTS 优先于 KAFKA_HEAP_OPTS。
+|`LOG_LEVEL` |设置为 DEBUG 即可启用全局 DEBUG 并输出到容器控制台，无需挂载日志配置。支持 ALL、TRACE、DEBUG、INFO、WARN、ERROR、FATAL、OFF，忽略大小写；未设置或为空时沿用基础镜像日志配置。
+|`KAFKA_LOG4J_OPTS` |显式非空设置时优先于 LOG_LEVEL，并输出忽略 LOG_LEVEL 的提示；用于自定义日志配置。
 |`KAFKA_OPTS` |默认含内置 JMX Exporter 的 -javaagent 参数。显式设置会覆盖镜像默认值；增加其他 JVM 选项时需保留该参数。设为空字符串可关闭 Agent。
 |===
 
 显式短名称优先于对应 CONNECT_ 变量。可以只读挂载 `/etc/kafka/connect-distributed.properties` 作为基础文件，环境变量覆盖同名属性。
 脚本生成的运行配置仅容器用户可读，启动时不输出敏感值。
+`LOG_LEVEL` 开关适用于默认 Kafka 3.9.1 日志运行时。需重新构建包含新版启动脚本的镜像，并重新创建容器后生效；已经运行的 Worker 可通过 Connect 日志 REST API 动态调整。
 默认镜像 JsonConverter 的 key/value schemas.enable 均为 false；若下游依赖逻辑类型元数据，显式配置并验证序列化契约。
 
 === 创建任务与修改配置

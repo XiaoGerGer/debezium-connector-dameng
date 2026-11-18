@@ -775,6 +775,7 @@ For preparing, inspect primary watermark writes, replay barriers and chunk queri
 Resources are in link:../docker/monitoring/[docker/monitoring]. The image includes JMX Exporter 1.4.0 at port 9404.
 Overriding KAFKA_OPTS must retain `-javaagent:/opt/jmx/jmx_prometheus_javaagent-1.4.0.jar=9404:/opt/jmx/jmx-exporter.yaml` to keep monitoring enabled.
 An empty KAFKA_OPTS disables it. JVM startup-argument changes require worker restart/recreation.
+With the default Kafka 3.9.1 base, set `LOG_LEVEL=DEBUG` to enable global DEBUG logs on the container console without mounting a logging configuration. Supported levels are ALL, TRACE, DEBUG, INFO, WARN, ERROR, FATAL and OFF (case insensitive); unset or empty retains the base logging defaults. Explicit nonempty `KAFKA_LOG4J_OPTS` takes precedence with a notice. Rebuild the image with the updated entrypoint and recreate the container to use this option. It does not change `KAFKA_OPTS` or the JMX agent.
 
 [source,yaml]
 ----
